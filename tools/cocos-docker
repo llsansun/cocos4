@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ENV_FILE="$ROOT_DIR/.cocos-docker.env"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./tools/cocos-docker image <version>
+  ./tools/cocos-docker shell <version>
+  ./tools/cocos-docker install <version>
+  ./tools/cocos-docker init <version>
+  ./tools/cocos-docker build <version> <creator|engine|cli>
+  ./tools/cocos-docker pack <version> engine
+  ./tools/cocos-docker auto-pack <version> engine [image-tar]
+  ./tools/cocos-docker run <version> -- <command...>
+  ./tools/cocos-docker doctor <version>
+
+Examples:
+  ./tools/cocos-docker image 4.0
+  ./tools/cocos-docker pack 4.0 engine
+  ./tools/cocos-docker auto-pack 4.0 engine cocos-dev-4.0.tar
+  ./tools/cocos-docker image 3.8
+  ./tools/cocos-docker pack 3.8.9 engine
+  ./tools/cocos-docker auto-pack 3.8.7 engine cocos-dev-3.8.tar
+  ./tools/cocos-docker image 2.4
+  ./tools/cocos-docker pack 2.4.16 engine
+USAGE
+}
+
+fail() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+normalize_version_key() {
+  echo "$1" | tr '.-' '__'
+}
+
+version_family() {
+  case "$1" in
+    2.4*) echo "2.4" ;;
+    3.8*) echo "3.8" ;;
+    4.0*) echo "4.0" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+load_env() {
+  if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+  fi
+}
+
+var_value() {
+  local name="$1"
+  printf '%s' "${!name:-}"
+}
+
+version_src() {
+  local key
+  key=$(normalize_version_key "$1")
+  var_value "COCOS_${key}_SRC"
+}
+
+version_image() {
+  local key family_key image
+  key=$(normalize_version_key "$1")
+  family_key=$(normalize_version_key "$(version_family "$1")")
+  image=$(var_value "COCOS_${key}_IMAGE")
+  [[ -n "$image" ]] || image=$(var_value "COCOS_${family_key}_IMAGE")
+  printf '%s' "${image:-cocos-dev:$(version_family "$1")}"
+}
+
+version_base_image() {
+  local key family_key image
+  key=$(normalize_version_key "$1")
+  family_key=$(normalize_version_key "$(version_family "$1")")
+  image=$(var_value "COCOS_${key}_BASE_IMAGE")
+  [[ -n "$image" ]] || image=$(var_value "COCOS_${family_key}_BASE_IMAGE")
+  printf '%s' "${image:-ubuntu:22.04}"
+}
+
+version_install_android() {
+  local key family_key value
+  key=$(normalize_version_key "$1")
+  family_key=$(normalize_version_key "$(version_family "$1")")
+  value=$(var_value "COCOS_${key}_INSTALL_ANDROID")
+  [[ -n "$value" ]] || value=$(var_value "COCOS_${family_key}_INSTALL_ANDROID")
+  printf '%s' "${value:-false}"
+}
+
+version_node_options() {
+  local key family_key value
+  key=$(normalize_version_key "$1")
+  family_key=$(normalize_version_key "$(version_family "$1")")
+  value=$(var_value "COCOS_${key}_NODE_OPTIONS")
+  [[ -n "$value" ]] || value=$(var_value "COCOS_${family_key}_NODE_OPTIONS")
+  printf '%s' "${value:---max-old-space-size=6144}"
+}
+
+version_cmd() {
+  local version="$1"
+  local family
+  local kind="$2"
+  local key family_key value default
+  family=$(version_family "$version")
+  key=$(normalize_version_key "$version")
+  family_key=$(normalize_version_key "$family")
+
+  case "$family:$kind" in
+    2.4:install) default="npm install" ;;
+    2.4:init) default="true" ;;
+    2.4:creator) default="npx gulp build" ;;
+    2.4:engine) default="npx gulp build" ;;
+    2.4:cli) default="true" ;;
+    2.4:pack_engine) default="if [ ! -f external/box2d/box2d.js ]; then echo 'Missing Cocos 2.4 external files. Please check out a complete 2.4.x engine source tree.' >&2; exit 1; fi && npx gulp build && mkdir -p /workspace/output/engine && tar --exclude='./node_modules' --exclude='./.git' -czf /workspace/output/engine/cocos-engine-${version}-$(date +%Y%m%d-%H%M%S).tar.gz bin cocos2d editor extensions external gulp licenses polyfill DebugInfos.json EngineErrorMap.md package.json package-lock.json README.md api.d.ts modules.json gulpfile.js index.js extends.js predefine.js tsconfig.json CHANGELOG.txt AUTHORS.txt" ;;
+    3.8:install) default="npm ci" ;;
+    3.8:init) default="cd native && npm install && npx gulp init" ;;
+    3.8:creator) default="npm run build" ;;
+    3.8:engine) default="npm run build" ;;
+    3.8:cli) default="true" ;;
+    3.8:pack_engine) default="if [ ! -f native/external/emscripten/webgpu/glslang.js ]; then cd native && npm install && npx gulp init && cd ..; fi && npm run build && mkdir -p /workspace/output/engine && tar --exclude='./node_modules' --exclude='./native/node_modules' --exclude='./.git' -czf /workspace/output/engine/cocos-engine-${version}-$(date +%Y%m%d-%H%M%S).tar.gz bin cocos native pal platforms editor external exports extensions scripts templates licenses @types DebugInfos.json DebugInfos.d.ts EngineErrorMap.md package.json package-lock.json cc.config.json cc.config.schema.json README.md README.zh-CN.md LICENSE.md tsconfig.json predefine.ts" ;;
+    4.0:install) default="npm install" ;;
+    4.0:init) default="npm run update:native-external" ;;
+    4.0:creator) default="npm run build" ;;
+    4.0:engine) default="npm run build" ;;
+    4.0:cli) default="npm run build:cli" ;;
+    4.0:pack_engine) default="if [ ! -f native/external/emscripten/webgpu/glslang.js ]; then npm run update:native-external; fi && npm run build && mkdir -p /workspace/output/engine && tar --exclude='./node_modules' --exclude='./native/node_modules' --exclude='./.git' -czf /workspace/output/engine/cocos-engine-${version}-$(date +%Y%m%d-%H%M%S).tar.gz bin cocos native pal platforms editor external exports extensions scripts templates licenses @types DebugInfos.json DebugInfos.d.ts EngineErrorMap.md package.json package-lock.json cc.config.json cc.config.schema.json README.md README.zh-CN.md LICENSE tsconfig.json predefine.ts" ;;
+    *:install) default="npm install" ;;
+    *:init) default="npm run update:native-external" ;;
+    *:creator) default="npm run build" ;;
+    *:engine) default="npm run build" ;;
+    *:cli) default="npm run build:cli" ;;
+    *:pack_engine) default="npm run build && mkdir -p /workspace/output/engine && tar --exclude='./node_modules' --exclude='./native/node_modules' --exclude='./.git' -czf /workspace/output/engine/cocos-engine-${version}-$(date +%Y%m%d-%H%M%S).tar.gz bin cocos native pal platforms editor external exports extensions scripts templates licenses @types DebugInfos.json DebugInfos.d.ts EngineErrorMap.md package.json package-lock.json cc.config.json cc.config.schema.json README.md README.zh-CN.md LICENSE tsconfig.json predefine.ts" ;;
+  esac
+
+  case "$kind" in
+    install)
+      value=$(var_value "COCOS_${key}_INSTALL_CMD")
+      [[ -n "$value" ]] || value=$(var_value "COCOS_${family_key}_INSTALL_CMD")
+      ;;
+    init)
+      value=$(var_value "COCOS_${key}_INIT_CMD")
+      [[ -n "$value" ]] || value=$(var_value "COCOS_${family_key}_INIT_CMD")
+      ;;
+    creator)
+      value=$(var_value "COCOS_${key}_BUILD_CREATOR_CMD")
+      [[ -n "$value" ]] || value=$(var_value "COCOS_${family_key}_BUILD_CREATOR_CMD")
+      ;;
+    engine)
+      value=$(var_value "COCOS_${key}_BUILD_ENGINE_CMD")
+      [[ -n "$value" ]] || value=$(var_value "COCOS_${family_key}_BUILD_ENGINE_CMD")
+      ;;
+    cli)
+      value=$(var_value "COCOS_${key}_BUILD_CLI_CMD")
+      [[ -n "$value" ]] || value=$(var_value "COCOS_${family_key}_BUILD_CLI_CMD")
+      ;;
+    pack_engine)
+      value=$(var_value "COCOS_${key}_PACK_ENGINE_CMD")
+      [[ -n "$value" ]] || value=$(var_value "COCOS_${family_key}_PACK_ENGINE_CMD")
+      ;;
+    *) fail "unknown command kind: $kind" ;;
+  esac
+  printf '%s' "${value:-$default}"
+}
+
+ensure_common_env() {
+  command -v docker >/dev/null 2>&1 || fail "docker is not installed or not in PATH"
+  [[ -f "$ENV_FILE" ]] || fail "missing $ENV_FILE; copy env/.env.example to .cocos-docker.env first"
+}
+
+ensure_version_env() {
+  local version="$1" src
+  ensure_common_env
+  src=$(version_src "$version")
+  [[ -n "$src" ]] || fail "missing COCOS_$(normalize_version_key "$version")_SRC in $ENV_FILE"
+  [[ -d "$src" ]] || fail "source directory does not exist: $src"
+  [[ -n "${OUTPUT_DIR:-}" ]] || fail "missing OUTPUT_DIR in $ENV_FILE"
+  [[ -n "${CACHE_DIR:-}" ]] || fail "missing CACHE_DIR in $ENV_FILE"
+  mkdir -p "$OUTPUT_DIR/$version" "$CACHE_DIR/$version"
+}
+
+node_modules_volume() {
+  local version="$1"
+  echo "cocos_${version//./_}_node_modules"
+}
+
+docker_image_exists() {
+  local image="$1"
+  docker image inspect "$image" >/dev/null 2>&1
+}
+
+node_modules_installed() {
+  local version="$1"
+  run_docker "$version" bash -lc 'test -d node_modules && test -n "$(find node_modules -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)"' >/dev/null 2>&1
+}
+
+run_docker() {
+  local version="$1"
+  shift
+  local src image nm_volume
+  src=$(version_src "$version")
+  image=$(version_image "$version")
+  nm_volume=$(node_modules_volume "$version")
+
+  local docker_tty_args=(-i)
+  if [[ -t 0 && -t 1 ]]; then
+    docker_tty_args=(-it)
+  fi
+
+  docker run --rm "${docker_tty_args[@]}" \
+    -e COCOS_SRC=/workspace/cocos \
+    -e COCOS_OUTPUT=/workspace/output \
+    -e COCOS_CACHE=/workspace/cache \
+    -e NODE_OPTIONS="$(version_node_options "$version")" \
+    -v "$src:/workspace/cocos" \
+    -v "$OUTPUT_DIR/$version:/workspace/output" \
+    -v "$CACHE_DIR/$version:/workspace/cache" \
+    -v "$nm_volume:/workspace/cocos/node_modules" \
+    "$image" "$@"
+}
+
+cmd=${1:-}
+version=${2:-}
+
+if [[ -z "$cmd" || "$cmd" == "-h" || "$cmd" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+load_env
+
+case "$cmd" in
+  image)
+    [[ -n "$version" ]] || fail "missing version"
+    docker build \
+      --build-arg BASE_IMAGE="$(version_base_image "$version")" \
+      --build-arg INSTALL_ANDROID="$(version_install_android "$version")" \
+      -t "$(version_image "$version")" \
+      "$ROOT_DIR/docker/$(version_family "$version")"
+    ;;
+  shell)
+    [[ -n "$version" ]] || fail "missing version"
+    ensure_version_env "$version"
+    run_docker "$version" bash
+    ;;
+  install|init)
+    [[ -n "$version" ]] || fail "missing version"
+    ensure_version_env "$version"
+    run_docker "$version" bash -lc "$(version_cmd "$version" "$cmd")"
+    ;;
+  build)
+    target=${3:-}
+    [[ -n "$version" ]] || fail "missing version"
+    [[ "$target" =~ ^(creator|engine|cli)$ ]] || fail "build target must be creator, engine, or cli"
+    ensure_version_env "$version"
+    run_docker "$version" bash -lc "$(version_cmd "$version" "$target")"
+    ;;
+  pack)
+    target=${3:-}
+    [[ -n "$version" ]] || fail "missing version"
+    [[ "$target" == "engine" ]] || fail "pack target currently only supports engine"
+    ensure_version_env "$version"
+    run_docker "$version" bash -lc "$(version_cmd "$version" pack_engine)"
+    ;;
+  auto-pack)
+    target=${3:-}
+    image_tar=${4:-cocos-dev-$(version_family "$version").tar}
+    [[ -n "$version" ]] || fail "missing version"
+    [[ "$target" == "engine" ]] || fail "auto-pack target currently only supports engine"
+    ensure_version_env "$version"
+
+    if docker_image_exists "$(version_image "$version")"; then
+      echo "image exists: $(version_image "$version")"
+    else
+      [[ -f "$image_tar" ]] || fail "image does not exist and tar file was not found: $image_tar"
+      echo "loading image from $image_tar"
+      docker load -i "$image_tar"
+    fi
+
+    if node_modules_installed "$version"; then
+      echo "node_modules already installed for $version, skip install"
+    else
+      echo "installing dependencies for $version"
+      run_docker "$version" bash -lc "$(version_cmd "$version" install)"
+    fi
+
+    run_docker "$version" bash -lc "$(version_cmd "$version" pack_engine)"
+    ;;
+  run)
+    [[ -n "$version" ]] || fail "missing version"
+    shift 2
+    [[ "${1:-}" == "--" ]] && shift
+    [[ $# -gt 0 ]] || fail "missing command after --"
+    ensure_version_env "$version"
+    run_docker "$version" "$@"
+    ;;
+  doctor)
+    [[ -n "$version" ]] || fail "missing version"
+    ensure_version_env "$version"
+    echo "version=$version"
+    echo "image=$(version_image "$version")"
+    echo "source=$(version_src "$version")"
+    echo "output=$OUTPUT_DIR/$version"
+    echo "cache=$CACHE_DIR/$version"
+    echo "node_modules_volume=$(node_modules_volume "$version")"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

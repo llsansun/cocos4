@@ -1,0 +1,1763 @@
+# 当前主流 RHI 架构调研与设计总结（增强版）
+
+> 本文基于《几个引擎的 RHI 层》PDF 全文整理，尽可能覆盖原文中涉及的类、模块、调用链、feature/capability 设计、后端差异和工程化经验。范围包括 LayaAir、Godot、wgpu、Unreal Engine 5、CryEngine、Dawn/WebGPU。本文不是简单介绍“什么是 RHI”，而是围绕真实引擎如何组织 RHI 层进行横向分析。
+
+---
+
+## 0. 阅读导图
+
+本文按以下路线展开：
+
+1. 先解释 RHI 的问题域：Device、Resource、Pipeline、Command、Shader、Barrier、Capability。
+2. 分别梳理六个系统：
+   - LayaAir：轻量 RenderDriver / WebGL / LayaX Native 抽象；
+   - Godot：`RenderingDevice`、`RenderingDeviceDriver`、`RenderingContextDriver` 三层结构；
+   - wgpu：WebGPU 语义、`wgpu-core` 厚语义层、`wgpu-hal` 薄后端层、Naga；
+   - UE5：`FDynamicRHI`、`FRHICommandList`、RHI Thread、RDG、feature/platform 体系；
+   - CryEngine：`DeviceManager`、PSO、ResourceSet、CommandList，老 D3D 架构现代化；
+   - Dawn：WebGPU 标准实现、Tint、Wire、Codegen、CTS、Native/Web/Wasm 路径。
+3. 最后做横向对比与自研 RHI 设计建议。
+
+---
+
+## 1. RHI 的本质：不是“包一层 API”，而是统一 GPU 编程模型
+
+RHI（Rendering Hardware Interface）通常被翻译成“渲染硬件接口”。如果只看表面，它像是把 Vulkan、Metal、D3D12、D3D11、OpenGL ES、WebGL、WebGPU 等 API 包装成一套统一函数。但真实引擎中的 RHI 远不止如此。
+
+完整 RHI 至少要覆盖以下领域：
+
+- **Instance / Adapter / Device**：枚举物理设备，选择 GPU，创建逻辑设备。
+- **Surface / Swapchain / Present**：把渲染结果显示到窗口、Canvas 或系统 surface。
+- **Resource**：Buffer、Texture、TextureView、Sampler、RenderTarget、DepthStencil 等。
+- **Binding**：DescriptorSet、BindGroup、ResourceSet、PipelineLayout、RootSignature。
+- **Pipeline**：Graphics Pipeline、Compute Pipeline、Pipeline State Object、RenderPass 兼容性。
+- **Command**：CommandEncoder、CommandBuffer、CommandList、RenderPassEncoder、ComputePassEncoder、Queue submit。
+- **Shader**：源语言、目标语言、IR、反射、binding layout、宏/变体、编译缓存。
+- **Synchronization**：resource usage、layout transition、barrier、queue ownership、fence、semaphore。
+- **Capability**：feature、limit、format support、shader model、API trait、toggle、workaround。
+- **Validation / Debug**：参数校验、资源生命周期校验、debug label、GPU marker、profiling、capture。
+- **平台工程**：Native/Web/Wasm、浏览器多进程、移动端限制、驱动 bug、构建系统。
+
+因此，现代 RHI 的核心任务是：
+
+> 在不同 GPU API 之间建立一套一致、可验证、可维护、可扩展的 GPU 编程模型。
+
+这也是为什么 PDF 中几个系统的差异巨大：LayaAir 更像轻量 API 适配层，wgpu/Dawn 更像标准化 GPU runtime，UE5 RHI 则是大型游戏引擎渲染执行系统的一部分。
+
+---
+
+## 2. 两种主要 RHI 范式
+
+### 2.1 GL/WebGL 风格：隐式状态机
+
+OpenGL/WebGL 的基本模型是：
+
+1. bind 当前 buffer/texture/program；
+2. 设置 render state；
+3. 调用 draw；
+4. 驱动内部维护大量隐式状态。
+
+优点：
+
+- 接口简单；
+- 学习成本低；
+- WebGL 生态成熟；
+- 对轻量 2D/3D 引擎足够实用。
+
+缺点：
+
+- 全局状态复杂，状态污染难排查；
+- 多线程录制能力弱；
+- pipeline 状态不够显式；
+- barrier 和资源状态对用户不可见；
+- 难以映射到 Vulkan/D3D12/Metal 的显式模型。
+
+LayaAir 的很多设计带有这种风格：`LayaGL` 全局入口、WebGL 后端、`GlCapable`、状态缓存、纹理上下文等。
+
+### 2.2 Vulkan/D3D12/Metal/WebGPU 风格：显式对象 + 显式命令
+
+现代图形 API 强调：
+
+- 明确 `Device`；
+- 明确资源 usage；
+- 明确 Pipeline/PSO；
+- 明确 BindGroup/DescriptorSet；
+- 明确 CommandBuffer；
+- 明确 Queue submit；
+- 明确同步与 barrier。
+
+优点：
+
+- 多线程友好；
+- 状态可控；
+- 性能上限高；
+- 驱动隐式行为少；
+- 更适合 RenderGraph 自动推导。
+
+缺点：
+
+- 使用复杂；
+- validation 和 resource tracking 成本高；
+- feature/limit/format 差异暴露更多；
+- Shader 与 pipeline layout 强绑定，编译链复杂。
+
+Godot、wgpu、UE5、Dawn 都更接近这一范式。CryEngine 则处在从 D3D 历史模型向现代显式模型演进的中间态。
+
+---
+
+## 3. LayaAir RHI：RenderDriver、`LayaGL` 与 WebGL/LayaX 后端
+
+### 3.1 总体定位
+
+LayaAir 的 RHI 不是追求 Vulkan/WebGPU 式完整显式抽象，而是服务于引擎跨 Web 和 Native 的渲染驱动层。它以 TypeScript 接口描述渲染能力和资源创建，以具体 Driver 适配 WebGL、OpenGLES 和 LayaX Native。
+
+核心路径可以概括为：
+
+```text
+上层渲染模块
+  → LayaGL 全局入口
+  → IRenderEngine / IRenderDeviceFactory / ITextureContext
+  → WebGLDriver / OpenGLESDriver / LayaXDriver
+  → WebGLRenderingContext / Native conch 对象 / OpenGLES
+```
+
+### 3.2 `LayaGL`：全局渲染入口
+
+`LayaGL` 是 LayaAir 渲染层的重要全局入口，通常保存：
+
+- 当前 `renderEngine`；
+- 当前 `renderDeviceFactory`；
+- 当前 `textureContext`；
+- 与 shader、buffer、texture、render target 创建相关的上下文。
+
+这种设计非常符合 JS/TS 引擎的使用习惯：上层不用传递复杂 `Device` 对象，只需要通过全局入口拿当前平台的渲染能力。
+
+优势是使用方便；代价是全局状态较强，对多设备、多窗口、多 GPU、多线程模型不够自然。
+
+### 3.3 `IRenderEngine`：能力查询和设备级操作
+
+`IRenderEngine` 承担统一渲染设备接口职责。原文提到其典型接口包括：
+
+- `getParams(params: RenderParams): number`：查询数值型设备参数；
+- `getCapable(capatableType: RenderCapable): boolean`：查询布尔能力；
+- `getTextureContext(): ITextureContext`：获取纹理上下文；
+- `startFrame()` / `endFrame()`：帧边界；
+- 创建 `ShaderData`、`CommandUniformMap`；
+- 可选创建 `ComputeShader`、`ComputeContext`、`DeviceBuffer`。
+
+这里已经能看到 LayaAir 的扩展方向：在 WebGL 传统能力之外，枚举中已经出现 `StorageBuffer`、`ComputeShader`、`IndirectDraw` 等现代 GPU 能力。但这些能力在不同后端中并不一定完整实现。
+
+### 3.4 `IRenderDeviceFactory`：资源工厂
+
+LayaAir 把资源创建抽到 Factory 中，例如：
+
+- VertexBuffer；
+- IndexBuffer；
+- ShaderInstance；
+- RenderState；
+- Texture；
+- RenderTarget；
+- UniformBuffer；
+- ComputeShader；
+- DeviceBuffer。
+
+这种 Factory 模型使上层无需知道当前后端类型。WebGL 后端创建 WebGL 对象，LayaX 后端创建 Native wrapper，OpenGLES 后端透传 native GLES 对象。
+
+它的定位接近：
+
+```text
+IRenderDeviceFactory = 资源创建入口 + 后端对象屏蔽层
+```
+
+### 3.5 `ITextureContext`：纹理操作独立化
+
+LayaAir 单独抽出 `ITextureContext`，说明纹理是渲染层中差异最大、操作最多的一类资源。纹理上下文通常处理：
+
+- 2D texture 创建；
+- cube texture；
+- 3D texture；
+- texture upload；
+- mipmap；
+- render texture；
+- depth texture；
+- compressed texture；
+- sRGB texture；
+- float/half-float texture；
+- native texture 对象桥接。
+
+这是 WebGL 引擎常见选择：纹理 API 差异和扩展判断很多，单独做 context 可以避免 `IRenderEngine` 过于臃肿。
+
+### 3.6 WebGL 后端：`WebGLEngine`、`GlCapable`、`GLParams`、`GLRenderState`
+
+PDF 中 LayaAir WebGL 后端重点包括：
+
+- `WebGLEngine`：WebGL 渲染设备包装；
+- `GlCapable`：feature 检测；
+- `GLParams`：数值参数查询；
+- `GLRenderState`：渲染状态封装；
+- WebGL context 创建逻辑：`webgl2`、`experimental-webgl2`、`webgl`、`experimental-webgl`；
+- `webglcontextlost` 事件处理；
+- active texture、buffer bind map、viewport cache 等状态缓存。
+
+这说明 `WebGLEngine` 并不是薄薄包一层 `gl`。它还维护了 GL 状态缓存，减少重复 bind 和 state change。这是 WebGL/OpenGL 风格 RHI 的典型优化：由于 API 是状态机，RHI 需要记录当前状态以避免无效调用。
+
+### 3.7 Native / LayaX 后端
+
+LayaX 后端通过 `_nativeObj` 与 native 层交互。例如：
+
+- `new window.conchLayaXDevice()` 创建 native device；
+- `initRenderEngine(canvas._nativeObj)` 把 native canvas 传给底层；
+- `getTextureContext()` 获取 native texture context；
+- `getParams()` 透传到底层；
+- `getCapable()` 透传到底层；
+- `enableUniformBufferObject`、`matUseUBO` 等配置同步到 native。
+
+OpenGLES 后端也类似，使用 `window.conchGLESEngine`，通过 `rt_getParams`、`rt_getCapable` 与 native 对象通信。
+
+这体现了 LayaAir 的跨语言桥接特点：TS 层接口稳定，Native 层通过 conch 对象承接真实实现。
+
+### 3.8 `RenderCapable`：flat capability 表
+
+LayaAir 的 feature 统一定义在 `RenderCapable` 枚举中。PDF 中列出的能力包括：
+
+- `Element_Index_Uint32`：32 位 index；
+- `Element_Index_Uint8`；
+- `TextureFormat_R32G32B32A32`：float32 texture；
+- `TextureFormat_R16G16B16A16`：float16 texture；
+- `Texture_anisotropic`：各向异性过滤；
+- `RenderTextureFormat_R16G16B16A16`；
+- `RenderTextureFormat_R32G32B32A32`；
+- `RenderTextureFormat_Depth`；
+- `RenderTextureFormat_ShadowMap`；
+- `Vertex_VAO`；
+- `DrawElement_Instance`；
+- 压缩纹理能力，例如 ASTC；
+- `Texture_SRGB`；
+- `MSAA`；
+- `UnifromBufferObject`；
+- `Texture3D`；
+- `Texture_FloatLinearFiltering`；
+- `Texture_HalfFloatLinearFiltering`；
+- `StorageBuffer`；
+- `ComputeShader`；
+- `IndirectDraw`。
+
+WebGL 后端的 `GlCapable` 内部维护：
+
+- `_extensionMap: Map<WebGLExtension, any>`；
+- `_capabilityMap: Map<RenderCapable, boolean>`。
+
+WebGL2 支持的能力直接判断，WebGL1 则通过扩展判断，例如：
+
+- `OES_element_index_uint` 支持 32 位 index；
+- `OES_vertex_array_object` 支持 VAO；
+- `ANGLE_instanced_arrays` 支持 instance draw；
+- float/half-float texture 依赖对应扩展；
+- float render target 依赖 color buffer float/half-float 扩展；
+- UBO 依赖 WebGL2；
+- 3D texture 依赖 WebGL2；
+- Compute/StorageBuffer/IndirectDraw 在 WebGL 路径通常不可用。
+
+### 3.9 LayaAir 小结
+
+LayaAir 的 RHI 价值在于：
+
+- 轻量、直接；
+- 适合 WebGL 生态；
+- TS 接口简单；
+- Driver/Factory 分离清晰；
+- Native 后端通过 conch 对象桥接；
+- capability map 能覆盖 WebGL 扩展差异。
+
+不足在于：
+
+- GL 状态机思维较重；
+- 没有完整现代 CommandBuffer / Queue / Barrier 语义；
+- feature 以 flat enum 为主，规模扩大后会膨胀；
+- 对 Vulkan/D3D12/Metal/WebGPU 的显式模型不够天然。
+
+---
+
+## 4. Godot RHI：`RenderingDevice`、Driver 与 Context 的分层
+
+### 4.1 总体架构
+
+Godot 的现代渲染抽象由三类核心对象组成：
+
+```text
+RenderingServer / Renderer
+  → RenderingDevice
+  → RenderingDeviceDriver
+  → Vulkan / D3D12 / Metal 等后端
+
+窗口与上下文路径：
+RenderingContextDriver
+  → surface / adapter / present / driver_create
+```
+
+其中：
+
+- `RenderingDevice`：面向 Godot 渲染系统的高层设备接口；
+- `RenderingDeviceDriver`：底层 RHI driver 接口；
+- `RenderingContextDriver`：平台上下文与设备枚举接口。
+
+这比 LayaAir 更接近现代 RHI 分层：上层不直接依赖后端 API，而是通过统一设备和 driver 操作资源、pipeline 和命令。
+
+### 4.2 opaque ID：资源句柄系统
+
+Godot 使用 `DEFINE_ID` 这类机制为不同资源定义 opaque ID，例如：
+
+- `BufferID`；
+- `TextureID`；
+- `SamplerID`；
+- `VertexFormatID`；
+- `CommandQueueID`；
+- `CommandQueueFamilyID`；
+- `CommandPoolID`；
+- `CommandBufferID`；
+- `FramebufferID`；
+- `ShaderID`；
+- `PipelineID`。
+
+这类 ID 的好处是：
+
+- 上层不持有后端裸指针；
+- 生命周期集中管理；
+- validation 更容易；
+- 后端实现可以替换；
+- 资源表可以做 debug name、leak check、引用关系追踪。
+
+对大型引擎来说，opaque handle 通常比直接暴露对象指针更稳。
+
+### 4.3 `RenderingContextDriver`：设备枚举与 present 能力
+
+`RenderingContextDriver` 负责：
+
+- 获取 device 数量：`device_get_count()`；
+- 获取 device 信息：`device_get()`；
+- 判断某个 device 是否支持指定 surface present：`device_supports_present()`；
+- 创建 `RenderingDeviceDriver`：`driver_create()`；
+- 释放 driver：`driver_free()`。
+
+这说明 Godot 明确区分：
+
+```text
+窗口/Surface/Adapter 层 ≠ 资源/命令/渲染设备层
+```
+
+这是现代 RHI 很关键的分层。Surface 受操作系统和窗口系统影响，Device/Command 则受图形 API 影响。两者耦合过深会导致后端维护困难。
+
+### 4.4 `RenderingDeviceDriver`：底层 RHI 接口
+
+`RenderingDeviceDriver` 负责底层渲染能力，包括：
+
+- Buffer 创建、更新、拷贝；
+- Texture 创建、view、format；
+- Sampler；
+- Shader；
+- Pipeline；
+- Framebuffer/RenderPass；
+- CommandQueue、CommandPool、CommandBuffer；
+- draw / dispatch / copy；
+- barrier / sync；
+- timestamp / profiling；
+- capability 查询。
+
+它更像 Godot 的真正 RHI/HAL。
+
+### 4.5 `RenderingDevice`：上层包装与策略层
+
+`RenderingDevice` 并不是简单转发 driver。它会做：
+
+- Godot RID/资源管理；
+- 参数校验；
+- feature 综合判断；
+- 默认资源处理；
+- 高层渲染对象创建；
+- 某些能力从 driver capabilities 推导，而不是直接问后端；
+- 与 Godot 渲染服务器集成。
+
+PDF 中提到 `SUPPORTS_ATTACHMENT_VRS` 这类 feature 在 `RenderingDevice` 层会综合 Fragment Shading Rate 和 Fragment Density Map capability，而不是直接裸查 driver。这体现了“上层语义 feature”与“底层 API capability”之间的转换。
+
+### 4.6 Godot feature / capability 体系
+
+Godot 的能力表达非常值得学习，它不是单纯 bool enum，而是多维系统：
+
+#### 4.6.1 `Features`
+
+用于布尔能力，例如：
+
+- `SUPPORTS_MULTIVIEW`；
+- `SUPPORTS_HALF_FLOAT`；
+- `SUPPORTS_ATTACHMENT_VRS`；
+- `SUPPORTS_METALFX_SPATIAL`；
+- `SUPPORTS_METALFX_TEMPORAL`；
+- `SUPPORTS_FRAGMENT_SHADER_WITH_ONLY_SIDE_EFFECTS`；
+- `SUPPORTS_BUFFER_DEVICE_ADDRESS`；
+- `SUPPORTS_IMAGE_ATOMIC_32_BIT`；
+- `SUPPORTS_VULKAN_MEMORY_MODEL`；
+- `SUPPORTS_FRAMEBUFFER_DEPTH_RESOLVE`；
+- `SUPPORTS_POINT_SIZE`；
+- `SUPPORTS_RAY_QUERY`；
+- `SUPPORTS_RAYTRACING_PIPELINE`；
+- `SUPPORTS_HDR_OUTPUT`；
+- `SUPPORTS_RASTERIZATION_RATE_MAP`；
+- `SUPPORTS_GPU_MAPPABLE_BUFFER`。
+
+#### 4.6.2 `Limit`
+
+用于数值限制，例如：
+
+- 最大 compute workgroup size X/Y/Z；
+- 最大 viewport dimension X/Y；
+- subgroup size；
+- subgroup min/max size；
+- subgroup 支持哪些 shader stage；
+- subgroup operations；
+- MetalFX temporal scaler min/max scale；
+- max shader varyings。
+
+这些不能用 bool 表达，必须通过 `limit_get()` 返回数值。
+
+#### 4.6.3 `Capabilities`
+
+用于描述 API 家族和版本，例如：
+
+- `device_family`：Vulkan、DirectX、Metal 等；
+- `version_major` / `version_minor`；
+- API 名称；
+- API 版本；
+- pipeline cache UUID。
+
+#### 4.6.4 `ApiTrait`
+
+`ApiTrait` 表达的不是硬件功能，而是 API 行为差异。例如某些坐标系、clip space、纹理坐标、NDC、render pass 行为、barrier 语义差异等。这类差异如果混进 feature，会让 capability 系统含义混乱。
+
+#### 4.6.5 专项 capability struct
+
+对于复杂能力，Godot 使用结构体表达，例如：
+
+- `MultiviewCapabilities`；
+- `FragmentShadingRateCapabilities`；
+- `FragmentDensityMapCapabilities`；
+- shader capabilities；
+- format capabilities；
+- subgroup capabilities。
+
+这样比把每个字段都拆成 feature 更清晰。
+
+#### 4.6.6 `DriverWorkarounds`
+
+现实驱动存在 bug。Godot 把 workaround 独立出来，避免把“驱动 bug 规避”伪装成“硬件能力”。这是成熟 RHI 必须考虑的问题。
+
+### 4.7 各后端能力检测
+
+#### Vulkan：extension + feature chain + property chain
+
+Godot Vulkan 后端会：
+
+- 读取 Vulkan API version；
+- 枚举 extension；
+- 判断 extension 是否启用；
+- 使用 `vkGetPhysicalDeviceFeatures2` 查询 feature chain；
+- 使用 `vkGetPhysicalDeviceProperties2` 查询 property chain；
+- 填充 shader capability、multiview、fragment shading rate、fragment density map、ray query 等缓存；
+- 最终由 `has_feature()` 查询这些缓存。
+
+Vulkan 的特点是 capability 信息非常细，但查询链条复杂。Godot 将其整理成自己的统一结构。
+
+#### D3D12：`CheckFeatureSupport`
+
+D3D12 主要通过 `ID3D12Device::CheckFeatureSupport` 查询能力，例如：
+
+- feature level；
+- shader model；
+- wave ops；
+- 16-bit native ops；
+- format relaxed casting；
+- raytracing；
+- resource binding tier；
+- typed UAV support。
+
+然后映射到 Godot 自己的 feature、limit 和 capability。
+
+#### Metal：`MetalDeviceProperties`
+
+Metal 后端使用 `MetalDeviceProperties` 和 `MTLDevice` 判断能力，例如：
+
+- MSL target version；
+- GPU address；
+- MetalFX spatial/temporal；
+- HDR output；
+- native image atomics；
+- MSAA depth resolve；
+- rasterization rate map。
+
+Metal 与 Vulkan/D3D12 的差异不仅是 API 名称不同，还包括能力暴露方式和平台限制不同，因此 `ApiTrait` 和专项 capability struct 很有必要。
+
+### 4.8 Godot 小结
+
+Godot 的 RHI 架构启示：
+
+- Context、Device、Driver 分层清楚；
+- opaque ID 有利于管理和校验；
+- feature、limit、capability、trait、workaround 分开表达；
+- 后端差异不会消失，但可以被结构化吸收；
+- 上层 `RenderingDevice` 可以提供比 driver 更稳定、更语义化的接口。
+
+---
+
+## 5. wgpu：WebGPU 语义、厚 Core、薄 HAL
+
+### 5.1 总体定位
+
+wgpu 可以理解为 Rust 生态的 WebGPU 实现与跨平台 RHI：
+
+```text
+应用代码
+  → wgpu 用户 API
+  → wgpu-core：WebGPU 语义、校验、生命周期、resource tracking
+  → wgpu-hal：薄 RHI/HAL
+  → Vulkan / Metal / DX12 / GLES
+```
+
+其关键不是“能跑多后端”，而是它建立了一套接近 WebGPU 标准的安全 GPU 编程模型。
+
+### 5.2 `wgpu-types`：协议层
+
+`wgpu-types` 不创建 GPU 对象，而是定义 API 数据结构，例如：
+
+- `Features`；
+- `Limits`；
+- `TextureFormat`；
+- `TextureUsages`；
+- `BufferUsages`；
+- `ShaderStages`；
+- `BindGroupLayoutEntry`；
+- `PipelineDescriptor`；
+- `CommandEncoderDescriptor`；
+- `RenderPassDescriptor`；
+- `SurfaceConfiguration`。
+
+把类型定义抽成单独 crate 的好处是：
+
+- API 协议稳定；
+- core 和用户层共享同一套描述；
+- backend 不直接污染公共类型；
+- 更方便做版本演进。
+
+### 5.3 `wgpu` 用户 API
+
+用户通常使用：
+
+- `Instance`；
+- `Adapter`；
+- `Device`；
+- `Queue`；
+- `Buffer`；
+- `Texture`；
+- `TextureView`；
+- `Sampler`；
+- `ShaderModule`；
+- `BindGroupLayout`；
+- `BindGroup`；
+- `PipelineLayout`；
+- `RenderPipeline`；
+- `ComputePipeline`；
+- `CommandEncoder`；
+- `CommandBuffer`；
+- `Surface`。
+
+典型调用链：
+
+```text
+Instance::new
+  → request_adapter
+  → request_device
+  → create_buffer / create_texture / create_shader_module / create_pipeline
+  → create_command_encoder
+  → begin_render_pass / begin_compute_pass
+  → set_pipeline / set_bind_group / draw / dispatch
+  → finish
+  → queue.submit
+```
+
+### 5.4 `wgpu-core`：真正复杂的语义层
+
+`wgpu-core` 承担：
+
+- adapter/device 管理；
+- feature/limit 过滤与校验；
+- resource id 管理；
+- resource lifetime；
+- buffer/texture usage 校验；
+- bind group layout 校验；
+- pipeline layout 校验；
+- render pass / compute pass 状态校验；
+- command encoder 状态机；
+- resource state tracking；
+- barrier 推导；
+- queue submit 生命周期；
+- pending writes；
+- error scope；
+- device lost；
+- surface 配置与 present；
+- debug label。
+
+可以说 wgpu 的 RHI 不是 `wgpu-hal` 最复杂，而是 `wgpu-core` 最复杂。因为跨平台一致性、安全性和 WebGPU 语义都压在 core 层。
+
+### 5.5 `wgpu-hal`：薄后端抽象
+
+`wgpu-hal` 定义统一 HAL trait，例如：
+
+- `Instance`；
+- `Adapter`；
+- `Device`；
+- `Queue`；
+- `CommandEncoder`；
+- `Surface`；
+- `Buffer`；
+- `Texture`；
+- `TextureView`；
+- `Sampler`；
+- `BindGroup`；
+- `PipelineLayout`；
+- `RenderPipeline`；
+- `ComputePipeline`。
+
+后端包括：
+
+- Vulkan；
+- Metal；
+- DX12；
+- GLES。
+
+每个后端实现同一套 trait，例如：
+
+```text
+VulkanInstance / MetalInstance / Dx12Instance / GlesInstance
+VulkanDevice / MetalDevice / Dx12Device / GlesDevice
+VulkanQueue / MetalQueue / Dx12Queue / GlesQueue
+```
+
+HAL 中大量接口是 `unsafe`，原因是：
+
+```text
+wgpu-hal 假设调用者已经完成 WebGPU 校验。
+wgpu-core 才负责状态、生命周期、usage、barrier、validation。
+```
+
+这就是“厚 core，薄 HAL”的本质。
+
+### 5.6 Instance → Adapter → Device 初始化流程
+
+wgpu 的初始化流程：
+
+1. 创建 `Instance`，内部保存多个 backend instance：`instance_per_backend`；
+2. 枚举 Adapter，遍历启用的 backend；
+3. HAL 返回 `ExposedAdapter`，包含：
+   - 后端真实 adapter；
+   - `AdapterInfo`：名称、vendor、device id、device type；
+   - features；
+   - capabilities；
+4. core 过滤 features 和 limits；
+5. 用户 `request_device` 时提交 required features 和 limits；
+6. core 校验 requested features/limits；
+7. HAL `Adapter::open()` 创建真实 device 和 queue。
+
+这里的重点是：Adapter 暴露的不一定等于后端原始能力，core 会根据 WebGPU 语义、安全策略和平台限制做过滤。
+
+### 5.7 CommandEncoder 状态机
+
+wgpu 的命令不是立即执行，而是通过 encoder 记录。Encoder 有严格状态机：
+
+- open/recording；
+- inside render pass；
+- inside compute pass；
+- closed/finished。
+
+非法行为会被校验，例如：
+
+- render pass 内不能随意做 copy；
+- pass 未结束不能 finish；
+- 同一资源读写冲突；
+- bind group layout 与 pipeline layout 不匹配；
+- buffer usage 不包含当前用途；
+- texture format 与 attachment 不匹配。
+
+### 5.8 Resource Tracking 与 Barrier
+
+wgpu 通过 resource tracking 记录资源在命令中的用途，例如：
+
+- Buffer：copy src/dst、vertex、index、uniform、storage、indirect；
+- Texture：copy src/dst、sampled、storage、render attachment、present；
+- Pass 内读写冲突；
+- Pass 间状态转换；
+- Queue submit 生命周期。
+
+最终由 core 推导后端需要的 barrier。对 Vulkan/D3D12 这类显式 API，这非常关键；对 Metal/GLES，则映射成对应的同步或省略。
+
+### 5.9 Surface 与 Swapchain
+
+wgpu 的 `Surface` 表达窗口/Canvas 输出目标。流程一般是：
+
+1. 从 window handle 创建 surface；
+2. 查询 surface capabilities；
+3. 配置 format、present mode、alpha mode、width/height；
+4. 每帧 acquire current texture；
+5. 渲染到 surface texture view；
+6. present。
+
+Surface 是平台强相关对象，因此由 Instance/Adapter/Device 协同处理，而不是简单 Texture。
+
+### 5.10 Naga：Shader 翻译与验证
+
+Naga 在 wgpu 中负责：
+
+- WGSL 解析；
+- SPIR-V 输入；
+- GLSL 输入；
+- 内部 IR；
+- 类型检查；
+- control flow 校验；
+- binding 校验；
+- 输出 MSL/HLSL/GLSL/SPIR-V；
+- 支持后端限制处理。
+
+现代 RHI 中，Shader 模块必须与 pipeline layout、bind group layout、feature 和 backend limits 一起校验。Naga 不是可有可无的工具，而是 wgpu 跨平台一致性的基础。
+
+### 5.11 unsafe HAL escape hatch
+
+wgpu 保留了 unsafe HAL 访问能力。用途包括：
+
+- 与外部图形库互操作；
+- 获取底层 Vulkan/D3D12/Metal 对象；
+- 调试或性能工具集成；
+- 引擎级高级优化。
+
+这是一种实用主义设计：普通用户走安全 WebGPU API，高级用户可以承担 unsafe 风险访问底层。
+
+### 5.12 wgpu 小结
+
+wgpu 的启示：
+
+- 现代 RHI 应把校验和资源状态作为核心能力；
+- HAL 层越薄越容易维护；
+- Shader 编译器是 RHI 的组成部分；
+- WebGPU 语义适合作为跨平台 GPU 编程模型；
+- 安全 API 与 unsafe escape hatch 可以并存。
+
+---
+
+## 6. Unreal Engine 5：RHI、RHI Thread 与 RDG 的工业级体系
+
+### 6.1 总体调用链
+
+UE5 的渲染栈可以概括为：
+
+```text
+Renderer / Render Pass 代码
+  → RDG（Render Dependency Graph）
+  → FRHICommandList
+  → FDynamicRHI / IRHICommandContext
+  → D3D12 / Vulkan / Metal / D3D11 / OpenGL / NullRHI
+```
+
+UE5 的现代渲染代码大多不是直接裸调 RHI，而是先通过 RDG 建图，声明 pass 和资源读写关系，再由 RDG 执行时落到 `FRHICommandList`。
+
+### 6.2 RHI 公共抽象层
+
+UE5 RHI 公共层定义大量核心类型：
+
+- `FDynamicRHI`；
+- `IDynamicRHIModule`；
+- `FRHICommandList`；
+- `FRHICommandListBase`；
+- `FRHICommandListImmediate`；
+- `IRHICommandContext`；
+- `IRHIComputeContext`；
+- `FRHITexture`；
+- `FRHIBuffer`；
+- `FRHIShader`；
+- `FRHIGraphicsPipelineState`；
+- `FRHIComputePipelineState`；
+- `FRHIUnorderedAccessView`；
+- `FRHIShaderResourceView`；
+- `ERHIFeatureLevel`；
+- `EShaderPlatform`；
+- `EPixelFormat`；
+- `GRHISupports*` 能力标志；
+- `GPixelFormats` 格式能力表。
+
+UE5 RHI 的抽象规模远大于轻量引擎，因为它要服务 AAA 级渲染、编辑器、资产烘焙、Shader 编译、平台裁剪和性能分析。
+
+### 6.3 `IDynamicRHIModule`：后端模块入口
+
+`IDynamicRHIModule` 是动态 RHI 后端的模块入口，典型职责：
+
+- 判断当前平台是否支持该 RHI：`IsSupported()`；
+- 按请求 feature level 创建 `FDynamicRHI`：`CreateRHI()`。
+
+Windows 上会根据配置、命令行、平台默认策略选择 D3D12、D3D11、Vulkan 等后端。流程中还会初始化 `DataDrivenShaderPlatformInfo`，读取平台 shader 能力配置。
+
+### 6.4 `FDynamicRHI`：设备级虚接口
+
+`FDynamicRHI` 是 UE5 后端对象统一抽象。它负责设备级资源创建和部分操作，例如：
+
+- `RHICreateBufferInitializer`；
+- `RHILockBuffer` / `RHIUnlockBuffer`；
+- `RHICreateTextureInitializer`；
+- `RHICreateTextureReference`；
+- `RHICreateShaderResourceView`；
+- `RHICreateUnorderedAccessView`；
+- 创建/获取 pipeline state；
+- 获取 command context；
+- 后端初始化与销毁。
+
+它的定位可以理解为：
+
+```text
+FDynamicRHI = 后端 Device + Resource Factory + 部分全局 RHI 服务
+```
+
+### 6.5 `FRHICommandList`：命令记录和调度容器
+
+UE5 的 `FRHICommandList` 不是简单命令数组。它承担：
+
+- 命令记录；
+- 命令内存分配；
+- bypass 模式；
+- task graph 调度；
+- RHI Thread 分发；
+- immediate command list；
+- parallel command list；
+- 与 `IRHICommandContext` 对接。
+
+`FRHICommandListBase` 内部有自己的内存栈，用于高效分配命令对象，避免频繁堆分配。这体现了 UE 的热路径性能意识。
+
+命令路径通常是：
+
+```text
+Renderer / RDG pass
+  → FRHICommandList 记录命令
+  → 如果 Bypass：直接调用 IRHICommandContext
+  → 否则：命令进入 TaskGraph / RHI Thread
+  → IRHICommandContext 执行
+  → 后端 command buffer / command list
+```
+
+### 6.6 `IRHICommandContext`：后端命令执行接口
+
+`IRHICommandContext` 是真正执行后端命令的上下文。可以将三者关系理解为：
+
+```text
+FDynamicRHI = 设备级接口
+FRHICommandList = 命令记录与调度容器
+IRHICommandContext = 命令执行接口
+```
+
+具体后端例如 D3D12/Vulkan/Metal 会实现自己的 command context，把 UE 的 RHI 命令翻译成真实 API 调用。
+
+### 6.7 RHI Thread 与并行执行
+
+UE5 支持不同模式：
+
+1. **Bypass**：直接执行 RHI 命令，调试或简单路径使用；
+2. **Render Thread 执行**：渲染线程记录并执行；
+3. **Separate RHI Thread**：独立 RHI 线程消费命令；
+4. **Parallel Command Lists**：并行记录部分命令。
+
+`FRHICommandListExecutor` 管理这些调度路径，并根据 `IsRunningRHIInSeparateThread()` 等条件决定是否允许并行。
+
+RHI Thread 的价值：
+
+- Render Thread 不必等待底层 API 提交；
+- 可以减少 CPU 侧提交阻塞；
+- 支持更复杂的帧流水；
+- 与 TaskGraph 结合，提高多核利用率。
+
+代价是同步和资源生命周期管理更复杂。
+
+### 6.8 RDG：Render Dependency Graph
+
+RDG 是 UE5 渲染现代化的核心。它位于 RHI 之上，负责帧级资源依赖分析。
+
+RDG 做的事情包括：
+
+- 声明 pass；
+- 声明 texture/buffer 读写；
+- 推导 pass 依赖；
+- 自动生成 barrier；
+- 管理 transient resource；
+- 资源别名 alias；
+- pass 裁剪；
+- async compute 调度；
+- debug/profiling 标记；
+- 最终把执行落到 `FRHICommandList`。
+
+UE5 的关键经验是：
+
+> RHI 不应单独承担所有资源状态推导。RenderGraph 拥有帧级全局视野，更适合做 barrier、生命周期和 pass 优化。
+
+### 6.9 资源创建与 `GPixelFormats`
+
+UE5 创建 texture 时会通过描述结构，例如 `FRHITextureCreateDesc`。创建过程中会校验：
+
+- format 是否小于 `PF_MAX`；
+- `GPixelFormats[Desc.Format].Supported` 是否为 true；
+- dimensions、array size、mip count 合法；
+- flags 与用途是否匹配。
+
+这里说明一个重要点：格式能力不应只用 `GRHISupportsASTC` 之类全局布尔表达。更准确的是使用格式表：
+
+- `GPixelFormats[PF_BC1].Supported`；
+- `GPixelFormats[PF_ASTC_4x4].Supported`；
+- `GPixelFormats[PF_ETC2_RGB].Supported`；
+- 格式 block size、component count、platform format、flags。
+
+### 6.10 UE5 Feature 体系
+
+UE5 feature 系统非常复杂，主要包括：
+
+#### 6.10.1 `ERHIFeatureLevel`
+
+表达渲染功能等级，例如移动端、SM5、SM6 等。它面向上层渲染路径选择，而不是底层 API 单项能力。
+
+#### 6.10.2 `EShaderPlatform`
+
+表达 shader 编译目标。即使两个平台 feature level 类似，shader platform 也可能不同，因为目标语言、宏、binding 模型、编译器不同。
+
+#### 6.10.3 `DataDrivenShaderPlatformInfo`
+
+通过 `.ini` 等数据配置声明平台 shader 能力，避免所有平台逻辑硬编码在 C++ 中。它服务于 shader permutation、编译裁剪和平台配置。
+
+#### 6.10.4 `GRHISupports*`
+
+运行时全局能力，例如是否支持某些渲染特性、UAV、timestamp、ray tracing、async compute、mesh shader、bindless 等。
+
+#### 6.10.5 `GPixelFormats`
+
+格式级能力表，解决 compressed format、depth/stencil format、render target format 等差异。
+
+#### 6.10.6 后端 runtime query 和平台配置
+
+D3D12/Vulkan/Metal 后端会查询真实 API 能力，再映射到 UE 的全局变量、格式表和 shader platform 数据。
+
+### 6.11 ValidationRHI 与 GPU Profiler
+
+UE5 包含：
+
+- `ValidationRHI`：包装真实 RHI，检查资源状态和调用合法性；
+- GPU profiler：记录 GPU event、pass 时间、统计信息；
+- debug marker；
+- GPU crash debugging；
+- PSO cache；
+- Pipeline library；
+- RHI resource tracking。
+
+工业级 RHI 必须支持“定位问题”和“分析性能”。否则项目规模一大，错误只会在后端 driver 或 GPU crash 中暴露，难以排查。
+
+### 6.12 UE5 小结
+
+UE5 的 RHI 代表大型商业引擎的复杂解法：
+
+- `FDynamicRHI` 负责后端设备抽象；
+- `FRHICommandList` 负责命令记录、调度、多线程；
+- `IRHICommandContext` 负责执行；
+- RDG 负责帧级资源依赖和 barrier；
+- feature/platform/shader/format 系统高度工程化；
+- validation/profiling 是必要组成。
+
+它不适合小引擎照搬，但非常适合学习“复杂渲染系统如何组织 RHI”。
+
+---
+
+## 7. CryEngine：DeviceManager、PSO、ResourceSet 与历史包袱
+
+### 7.1 总体背景
+
+CryEngine 的 RHI 集中在类似 `XRenderD3D9/DeviceManager/` 的路径下，保留大量 D3D 命名，例如 D3D、DXGI、D3D11 类型。但现代版本通过 `DeviceManager` 系列对象支持 DX11、DX12、Vulkan、GNM 等后端。
+
+它的设计不是纯虚接口式 `IRHI`，而是：
+
+1. 公共层定义 `CDeviceObjectFactory`、`CDeviceCommandList`、`CDeviceResourceSet`、`CDevicePSO` 等统一对象；
+2. 编译期通过 `CRY_RENDERER_DIRECT3D`、`CRY_RENDERER_VULKAN`、`CRY_RENDERER_GNM` 等宏选择后端实现；
+3. 上层渲染代码面向 DeviceManager 公共对象；
+4. 后端对象内部持有真实 API 对象，如 `ID3D11Device`、`ID3D12Device`、`VkDevice`。
+
+### 7.2 `CDeviceObjectFactory`：Device + Factory + ResourceManager + PSOCache
+
+`CDeviceObjectFactory` 是 CryEngine 这套 RHI 的核心门面，负责：
+
+- 绑定真实后端 device；
+- 创建 PSO；
+- 创建 ResourceSet；
+- 创建 ResourceLayout；
+- 获取或创建 RenderPass；
+- 查询 format support；
+- 管理 pipeline/resource cache；
+- 保存后端 device 指针；
+- 管理 command list pool/deferred context。
+
+它不像 wgpu 那样把 `Device`、`Queue`、`ResourceManager`、`PSOCache` 分得很细，而是更像历史演进中形成的综合门面。
+
+### 7.3 后端编译期分支
+
+CryEngine 后端选择带有明显编译期分支：
+
+- DX12 路径保存 `NCryDX12::CDevice`；
+- Vulkan 路径保存 `NCryVulkan::CDevice`；
+- D3D11 路径保存 `ID3D11Device`、deferred context；
+- GNM 路径使用平台特定实现。
+
+这种方式性能直接、历史兼容性好，但后端差异容易通过宏扩散到公共层。
+
+### 7.4 CommandList 与接口拆分
+
+CryEngine 将命令接口拆成：
+
+- `CDeviceGraphicsCommandInterface`；
+- `CDeviceComputeCommandInterface`；
+- `CDeviceCopyCommandInterface`；
+- `CDeviceNvidiaCommandInterface`；
+- `CDeviceCommandList`。
+
+图形命令接口包含：
+
+- `ClearState`；
+- `PrepareUAVsForUse`；
+- `PrepareRenderPassForUse`；
+- `PrepareResourceForUse`；
+- `PrepareResourcesForUse`；
+- `PrepareInlineConstantBufferForUse`；
+- `PrepareInlineShaderResourceForUse`；
+- `PrepareVertexBuffersForUse`；
+- `BeginRenderPass` / `EndRenderPass`；
+- `SetViewports`；
+- `SetPipelineState`；
+- `SetResourceLayout`；
+- `SetResources`。
+
+Compute 接口类似，包含 UAV、ResourceSet、Inline ConstantBuffer、Compute PSO 设置。Copy 接口包含 Buffer/Texture/D3DResource 之间的多种 copy 重载，并支持 `SResourceRegionMapping`。
+
+`CDeviceCommandList` 本身不增加数据成员，只是把底层 impl 解释为不同接口。这种写法追求零额外开销，但也说明架构上高度依赖 C++ 编译期布局和宏。
+
+### 7.5 PSO 与 ResourceSet
+
+CryEngine 现代化的重要标志是引入：
+
+- `CDevicePSO`：Pipeline State Object；
+- `CDeviceGraphicsPSO`；
+- `CDeviceComputePSO`；
+- `CDeviceResourceSet`；
+- `CDeviceResourceLayout`；
+- `CDeviceRenderPass`。
+
+这说明它从传统 D3D11 的动态状态设置逐渐转向现代 API 的不可变 pipeline + resource set 模型。
+
+PSO 通常绑定：
+
+- shader stages；
+- rasterizer state；
+- blend state；
+- depth stencil state；
+- input layout；
+- render target format；
+- primitive topology；
+- sample count。
+
+ResourceSet 则统一 SRV/UAV/CBV/Sampler 等绑定资源。
+
+### 7.6 Resource preparation 与 barrier
+
+CryEngine 的命令接口中多次出现 `Prepare*ForUse`，例如：
+
+- `PrepareResourceForUse`；
+- `PrepareResourcesForUse`；
+- `PrepareUAVsForUse`；
+- `PrepareRenderPassForUse`；
+- `PrepareVertexBuffersForUse`。
+
+这类函数体现现代 RHI 的一个关键动作：在真正 draw/dispatch 之前，必须让资源进入正确状态，完成必要 barrier、layout transition 或 descriptor 绑定准备。
+
+### 7.7 Feature 与 Format 查询
+
+CryEngine 使用混合方式表达能力：
+
+- `RFT_*` feature flags；
+- shader model；
+- API-specific feature query；
+- `QueryFormatSupport(D3DFormat Format)`；
+- 编译宏；
+- 后端 runtime query。
+
+这种系统反映了历史包袱：能力信息散落在 flags、format table、后端查询和宏中。它能工作，但不如 Godot/Dawn 的 feature/limit/workaround 分层清晰。
+
+### 7.8 CryEngine 小结
+
+CryEngine 的价值是提供“老牌引擎现代化”的样本：
+
+- 不能完全推倒重来；
+- 通过 DeviceManager 收敛后端；
+- 通过 PSO/ResourceSet/CommandList 适配现代 API；
+- 编译期后端分支保留性能和历史兼容；
+- 但抽象纯度和可读性不如新设计。
+
+---
+
+## 8. Dawn：WebGPU 标准实现、Tint、Wire 与工程化生态
+
+### 8.1 Dawn 的定位
+
+Dawn 是 WebGPU 的原生实现和跨后端 GPU 抽象。它的目标不是服务某个游戏引擎，而是实现 WebGPU 规范，并被 Chromium、Node、Native 应用和 Wasm/Emscripten 场景使用。
+
+Dawn 仓库核心模块包括：
+
+- **Dawn Native**：WebGPU C/C++ API 的原生实现；
+- **Tint**：WGSL shader 编译器/转换器/验证器；
+- **Wire**：WebGPU 命令 client/server 序列化层；
+- **Backend**：映射到 Metal、D3D12、Vulkan、OpenGL 等；
+- **Codegen**：从 `dawn.json` 生成 C API、C++ wrapper、wire 命令、proc table 等；
+- **测试体系**：Dawn 单测、Tint 测试、WebGPU CTS、后端 GPU 测试。
+
+### 8.2 Dawn Native 对象模型
+
+Dawn Native 实现 WebGPU 对象：
+
+- `Instance`；
+- `Adapter`；
+- `Device`；
+- `Queue`；
+- `Buffer`；
+- `Texture`；
+- `TextureView`；
+- `Sampler`；
+- `BindGroupLayout`；
+- `BindGroup`；
+- `PipelineLayout`；
+- `RenderPipeline`；
+- `ComputePipeline`；
+- `CommandEncoder`；
+- `CommandBuffer`；
+- `RenderPassEncoder`；
+- `ComputePassEncoder`；
+- `ShaderModule`。
+
+相关核心文件包括：
+
+- `src/dawn/native/Instance.cpp`；
+- `src/dawn/native/Adapter.cpp`；
+- `src/dawn/native/Device.cpp`；
+- `src/dawn/native/Queue.cpp`；
+- `src/dawn/native/CommandEncoder.cpp`；
+- `src/dawn/native/CommandBuffer.cpp`；
+- `src/dawn/native/ShaderModule.cpp`。
+
+### 8.3 Base + Backend Impl 模式
+
+Dawn 采用公共基类 + 后端实现类：
+
+- `DeviceBase`：平台无关逻辑、验证、生命周期管理；
+- `metal::Device` / `vulkan::Device` / `d3d12::Device`：平台实现；
+- `QueueBase`：提交逻辑、序列号、回调事件；
+- `metal::Queue` / `vulkan::Queue` / `d3d12::Queue`：后端提交；
+- `PhysicalDeviceBase`：物理设备能力；
+- `Adapter`：对外暴露 adapter。
+
+典型资源创建流程：
+
+```text
+DeviceBase::CreateBuffer()
+  → ValidateBufferDescriptor()
+  → backend::Device::CreateBufferImpl()
+```
+
+这说明 Dawn 把 validation 放在公共层，把真实 API 创建放在后端 impl。
+
+### 8.4 错误处理：`MaybeError`、`ResultOrError<T>`、`DAWN_TRY`
+
+Dawn native 代码大量使用：
+
+- `MaybeError`；
+- `ResultOrError<T>`；
+- `DAWN_TRY`。
+
+这使错误传播规范化。对于 WebGPU 这种需要严格 validation 的 API，错误处理不能靠断言或后端 crash，必须成为 API 语义的一部分。
+
+### 8.5 CommandEncoder / Queue.Submit
+
+Dawn 命令流程：
+
+1. 创建 `CommandEncoder`；
+2. 记录 render pass / compute pass / copy；
+3. 命令不会立即执行，而是记录到命令流；
+4. `Finish()` 生成 `CommandBuffer`；
+5. `Queue.Submit()` 统一提交；
+6. 后端把抽象命令转换为 Metal command buffer、D3D12 command list、Vulkan command buffer 等。
+
+相关文件包括：
+
+- `src/dawn/native/CommandEncoder.cpp`；
+- `src/dawn/native/CommandBuffer.cpp`；
+- `src/dawn/native/CommandAllocator.cpp`；
+- `src/dawn/native/Queue.cpp`；
+- `src/dawn/native/metal/QueueMTL.mm`；
+- `src/dawn/native/vulkan/QueueVk.cpp`；
+- `src/dawn/native/d3d12/QueueD3D12.cpp`。
+
+### 8.6 Tint：WGSL/Shader 编译工具链
+
+Tint 负责：
+
+- WGSL 解析；
+- AST/IR 构建；
+- 语义验证；
+- transform；
+- 反射；
+- 输出 MSL；
+- 输出 HLSL；
+- 输出 SPIR-V；
+- 输出 GLSL。
+
+相关目录：
+
+- `src/tint/`；
+- `src/tint/lang/wgsl/`；
+- `src/tint/lang/spirv/`；
+- `src/tint/lang/msl/`；
+- `src/tint/lang/hlsl/`；
+- `src/tint/lang/glsl/`。
+
+Dawn Native 的 `ShaderModule` 会调用 Tint 做解析、反射和验证。Dawn 不只是“把 WGSL 交给驱动”，而是在提交给后端前就要保证 WebGPU shader 语义成立。
+
+### 8.7 Wire：跨进程/远程调用层
+
+Wire 用于把 WebGPU 调用序列化，典型场景是 Chromium renderer process 到 GPU process。
+
+流程：
+
+```text
+Client WebGPU API
+  → wire client proc
+  → command serializer
+  → transport
+  → wire server
+  → Dawn native proc table
+  → native backend
+```
+
+Wire 的核心思想：
+
+- Client 不直接持有真实 GPU 对象，只持有 handle/id；
+- API 调用被序列化为命令；
+- Server 反序列化后调用 Dawn Native；
+- 支持跨进程、安全沙箱、远程 GPU 调用；
+- object lifetime 和 error 需要跨边界同步。
+
+相关路径：
+
+- `src/dawn/wire/`；
+- `src/dawn/wire/client/`；
+- `src/dawn/wire/server/`；
+- `include/dawn/wire/`。
+
+### 8.8 Codegen：`dawn.json`
+
+Dawn 使用 `dawn.json` 描述 WebGPU API，再通过 generator 生成：
+
+- C API；
+- C++ wrapper；
+- proc table；
+- wire 命令结构；
+- client/server dispatch；
+- object type 映射；
+- validation/转换胶水。
+
+相关路径：
+
+- `dawn.json`；
+- `generator/`；
+- `generator/dawn_json_generator.py`；
+- `generator/templates/`；
+- `docs/dawn/codegen.md`。
+
+好处是保证 C API、C++ wrapper、Wire 协议、ProcTable 一致，避免手写重复样板代码。
+
+### 8.9 Feature、Limits、Toggles、Workarounds
+
+Dawn 将后端差异统一为 WebGPU 能力体系：
+
+- `features`：标准能力；
+- `limits`：数值限制；
+- `toggles`：运行时开关；
+- `workarounds`：驱动 bug 修正；
+- `experimental features`：实验能力；
+- `requiredFeatures`：创建 Device 时用户请求的能力。
+
+典型流程：
+
+1. 后端 `PhysicalDevice` 收集原始能力；
+2. Adapter 暴露过滤后的 features/limits；
+3. 用户 `CreateDevice` 请求 required features；
+4. Dawn 校验 requested features 是否支持；
+5. Device 保存启用能力；
+6. 后续 API validation 读取 Device capabilities。
+
+这和 Godot 的分层思想类似，但 Dawn 更强调 WebGPU 规范一致性。
+
+### 8.10 `AllowUnsafeAPIs` 与 toggles
+
+Dawn 的 toggles 可以控制实验或不安全路径。例如某些 unsafe API 默认不能随意启用，需要显式 toggle。这样可以在标准 API、实验 API、调试路径、驱动 workaround 之间建立清晰边界。
+
+### 8.11 构建与测试体系
+
+Dawn 工程化非常完整，包含：
+
+- `BUILD.gn`：Chromium/GN 构建；
+- `BUILD.bazel`：Bazel 构建；
+- `CMakeLists.txt`：CMake 构建；
+- `DEPS`：Chromium 风格依赖；
+- `gclient sync`；
+- `gn gen`；
+- `ninja`；
+- `test/`；
+- `testing/`；
+- `webgpu-cts/`；
+- Tint parser/validator/transform 测试；
+- Wire client/server 测试；
+- codegen 测试；
+- 后端 GPU 测试。
+
+对标准实现来说，CTS 极其重要。没有一致性测试，WebGPU API 很难保证跨浏览器、跨后端行为一致。
+
+### 8.12 Dawn Native vs 浏览器 WebGPU vs `emdawnwebgpu`
+
+需要区分三条路径：
+
+#### Dawn Native
+
+```text
+C/C++ webgpu.h
+  → Dawn Native
+  → Metal / Vulkan / D3D12 / GL
+```
+
+这是让 C/C++ 世界拥有 WebGPU 能力，不依赖浏览器 JS API。
+
+#### 浏览器 WebGPU
+
+```text
+JavaScript navigator.gpu.requestAdapter()
+  → Browser WebGPU implementation
+  → GPU process / Dawn or platform backend
+```
+
+这是 Web 页面使用 WebGPU 的标准方式。
+
+#### `emdawnwebgpu`
+
+```text
+C/C++ webgpu.h
+  → Emscripten/Wasm
+  → browser WebGPU JavaScript binding
+  → 浏览器 WebGPU 后端
+```
+
+它不是 Dawn Native 的简单替代，而是让 C/C++/Wasm 程序调用浏览器 WebGPU。
+
+选择建议：
+
+- Web app：优先浏览器原生 WebGPU；
+- C/C++ 引擎移植 Web：Wasm + `emdawnwebgpu`；
+- Native C++ 工具/应用：Dawn Native；
+- Node GPU 工具：`dawn.node` 或相关 Node binding。
+
+### 8.13 Dawn 小结
+
+Dawn 的本质是：
+
+```text
+WebGPU API 描述
+  → Codegen 生成 C/C++/Wire 接口
+  → Dawn Native 做统一验证和对象模型
+  → Tint 处理 WGSL/Shader
+  → Backend 翻译到 Metal/D3D12/Vulkan/OpenGL
+  → Wire 支持跨进程远程调用
+  → CTS/单测保证规范一致性
+```
+
+它是最标准化、工程化程度最高的 RHI 案例之一。
+
+---
+
+## 9. 六套 RHI 横向对比
+
+| 系统 | 定位 | 抽象风格 | 核心分层 | 后端 | 资源模型 | 命令模型 | Shader | 能力系统 |
+|---|---|---|---|---|---|---|---|---|
+| LayaAir | Web/Native 轻量引擎 | GL/WebGL 偏多 | `LayaGL` + `IRenderEngine` + Factory + Driver | WebGL、OpenGLES、LayaX | WebGL 对象包装 + Native wrapper | 较轻，偏即时状态机 | GLSL/WebGL 管线 + Native compiler | `RenderCapable` flat enum + GL extension |
+| Godot | 开源现代引擎 | 显式 API | `RenderingDevice` + `RenderingDeviceDriver` + `RenderingContextDriver` | Vulkan、D3D12、Metal | opaque ID | RD driver command | Godot shader 体系 | Features/Limits/Capabilities/ApiTrait/Workarounds |
+| wgpu | Rust/WebGPU RHI | WebGPU 显式模型 | `wgpu` + `wgpu-core` + `wgpu-hal` + Naga | Vulkan、Metal、DX12、GLES | WebGPU object + ID tracking | Encoder → CommandBuffer → Queue | Naga | Features/Limits/Downlevel/format caps |
+| UE5 | AAA 引擎执行层 | RHI + RDG + 多线程 | Renderer/RDG → CommandList → DynamicRHI → backend | D3D12、Vulkan、Metal 等 | `FRHIResource` 系列 | `FRHICommandList` + RHI Thread | ShaderPlatform + Compiler + permutation | FeatureLevel/ShaderPlatform/GRHISupports/GPixelFormats |
+| CryEngine | 老牌引擎现代化 | D3D 历史 + 现代 Device | DeviceManager + Factory + PSO + ResourceSet | D3D、Vulkan、GNM | `CDevice*` 对象 | `CDeviceCommandList` | shader model + platform compiler | RFT flags + format query + runtime query |
+| Dawn | WebGPU 标准实现 | WebGPU 显式模型 | Native + Tint + Wire + Codegen | D3D12、Metal、Vulkan、GL | WebGPU object base + backend impl | Encoder → CommandBuffer → Queue | Tint | features/limits/toggles/workarounds/CTS |
+
+---
+
+## 10. Feature/Capability 设计专题
+
+### 10.1 为什么不能只用 bool enum
+
+早期 RHI 常用：
+
+```text
+supportsInstancing()
+supportsFloatTexture()
+supportsDepthTexture()
+```
+
+或者一个 flat enum，例如 LayaAir 的 `RenderCapable`。这对 WebGL 级别引擎足够，但现代 API 会遇到问题：
+
+- 有些能力是数值限制，不是 bool；
+- 有些能力按 format 区分；
+- 有些能力是 shader 编译目标；
+- 有些是 API 行为差异，不是硬件能力；
+- 有些是驱动 bug workaround；
+- 有些是实验开关；
+- 有些只在特定 feature level 下启用；
+- 有些影响 asset cooking 和 shader permutation。
+
+### 10.2 推荐能力分层
+
+综合 Godot、wgpu、UE5、Dawn，较合理的能力系统应包括：
+
+- `Features`：布尔能力，例如 ray query、multiview、timestamp query；
+- `Limits`：最大纹理尺寸、最大 workgroup size、最大 bind group 数；
+- `FormatCapabilities`：某格式是否可 sample、render、storage、blend、filter；
+- `ApiTraits`：坐标系、NDC、clip space、depth range、binding 模型差异；
+- `ShaderPlatform`：shader 编译目标和宏；
+- `FeatureLevel`：上层渲染等级；
+- `Toggles`：实验/调试/强制路径；
+- `Workarounds`：驱动 bug 规避；
+- `DownlevelCapabilities`：低端/旧 API 降级能力。
+
+### 10.3 各系统经验
+
+- LayaAir：简单实用，但 flat enum 容易膨胀；
+- Godot：分类清晰，特别是 `ApiTrait` 和专项 capability struct；
+- wgpu：符合 WebGPU 标准，core 会过滤 features/limits；
+- UE5：能力系统服务 shader permutation、platform、runtime 和 format；
+- CryEngine：历史混合结构，实用但分散；
+- Dawn：features/limits/toggles/workarounds 与 validation 强绑定。
+
+---
+
+## 11. 资源模型专题
+
+现代 RHI 资源模型趋势：
+
+1. `Buffer` 必须声明 usage；
+2. `Texture` 和 `TextureView` 分离；
+3. `Sampler` 独立；
+4. `BindGroup/DescriptorSet/ResourceSet` 表示资源绑定集合；
+5. `PipelineLayout/ResourceLayout` 表示 shader 可见资源布局；
+6. `Pipeline/PSO` 尽量不可变并缓存；
+7. Render target/depth stencil 通过 render pass descriptor 声明；
+8. 资源状态不能只靠 driver 隐式处理。
+
+对比：
+
+- LayaAir：资源对象更贴近 WebGL texture/buffer/program 包装；
+- Godot：资源通过 opaque ID 管理；
+- wgpu/Dawn：完全 WebGPU 对象模型；
+- UE5：`FRHIResource` 家族 + RDG transient resource；
+- CryEngine：`CDeviceBuffer`、`CDeviceTexture`、`CDeviceResourceSet`、`CDevicePSO`。
+
+---
+
+## 12. 命令模型专题
+
+### 12.1 三类命令模型
+
+#### 即时式状态机
+
+代表：WebGL/OpenGL 风格。
+
+```text
+bind texture
+bind buffer
+use program
+set state
+draw
+```
+
+优点是简单；缺点是全局状态、难多线程、难预校验。
+
+#### Encoder/CommandBuffer
+
+代表：wgpu、Dawn。
+
+```text
+CommandEncoder
+  → RenderPassEncoder / ComputePassEncoder
+  → finish CommandBuffer
+  → Queue.submit
+```
+
+优点是可以在提交前 validation、tracking、barrier 推导。
+
+#### CommandList + 执行线程
+
+代表：UE5。
+
+```text
+FRHICommandList
+  → TaskGraph / RHI Thread
+  → IRHICommandContext
+  → backend command list
+```
+
+优点是适合大型多线程渲染器；代价是调度复杂。
+
+### 12.2 命令模型中的关键检查
+
+成熟 RHI 应检查：
+
+- command encoder 是否已 finish；
+- 是否在合法 pass 内调用命令；
+- pipeline 是否匹配当前 pass；
+- bind group/resource layout 是否匹配 pipeline；
+- buffer/texture usage 是否包含当前用途；
+- attachment format 是否匹配 pipeline；
+- render pass load/store 是否合理；
+- draw index/vertex buffer 是否绑定；
+- compute dispatch workgroup 是否超过 limit。
+
+wgpu 和 Dawn 把这些做成核心 validation；UE5 则通过 RHI validation、RDG validation 和后端 debug layer 共同覆盖。
+
+---
+
+## 13. Shader 管线专题
+
+### 13.1 Shader 为什么属于 RHI 核心
+
+现代 RHI 中，Shader 决定：
+
+- resource binding layout；
+- pipeline layout；
+- vertex input；
+- render target format 兼容性；
+- feature requirement；
+- workgroup size；
+- shader stage；
+- target backend language。
+
+因此 shader 编译链不应脱离 RHI 单独存在。
+
+### 13.2 六个系统对比
+
+- LayaAir：主要服务 WebGL/OpenGLES GLSL 管线，Native 有 `LayaXShaderCompiler`；
+- Godot：自有 shader 语言与渲染设备结合；
+- wgpu：Naga 负责 WGSL/SPIR-V/GLSL 等输入和 MSL/HLSL/GLSL/SPIR-V 输出；
+- UE5：ShaderPlatform、ShaderCompiler、permutation、DDC/cache、material system 深度绑定；
+- CryEngine：shader model、平台编译、历史 shader 系统与现代后端结合；
+- Dawn：Tint 实现 WGSL parsing、validation、transform、backend output。
+
+### 13.3 自研建议
+
+自研 RHI 至少应考虑：
+
+- 统一 shader 描述；
+- shader reflection；
+- binding layout 自动生成或校验；
+- pipeline cache key；
+- 后端目标语言；
+- 编译错误映射；
+- shader variant/permutation 控制；
+- 离线编译与运行时编译边界。
+
+---
+
+## 14. Barrier、Resource Tracking 与 RenderGraph
+
+### 14.1 隐式模型
+
+WebGL/OpenGL 中资源状态大多由 driver 隐式处理，RHI 层关注 bind 和 state cache。简单但不可控。
+
+### 14.2 Core 自动追踪模型
+
+wgpu/Dawn 采用：
+
+- 资源声明 usage；
+- command encoder 记录读写；
+- core validation 检查冲突；
+- 后端生成 barrier；
+- queue submit 时推进生命周期。
+
+适合标准化、安全 API。
+
+### 14.3 RenderGraph 推导模型
+
+UE5 RDG 采用：
+
+- pass 声明资源读写；
+- graph 全局分析；
+- 推导依赖；
+- 自动 barrier；
+- transient resource 分配；
+- alias 和 pass culling。
+
+适合复杂帧图。相比单个 CommandEncoder，RenderGraph 更知道全帧资源用途，因此优化空间更大。
+
+### 14.4 CryEngine 的 `Prepare*ForUse`
+
+CryEngine 命令接口里的 `PrepareResourceForUse`、`PrepareUAVsForUse`、`PrepareRenderPassForUse` 等体现了资源状态准备逻辑。这是旧式渲染器向现代 barrier 模型迁移的一种形式。
+
+---
+
+## 15. Native / Web / Wasm 路径专题
+
+### 15.1 WebGL 路径
+
+优点：覆盖广、部署简单、兼容旧设备。缺点：能力有限，API 模型老，状态隐式，Compute/Storage/Indirect 等能力受限。
+
+### 15.2 WebGPU 路径
+
+优点：对象模型现代，接近 Vulkan/D3D12/Metal，支持 compute、storage buffer、现代 binding。缺点：生态仍在发展，浏览器兼容和规范限制需要关注。
+
+### 15.3 Native 路径
+
+Native RHI 可以直接使用 Vulkan/D3D12/Metal，性能和能力最强，但平台差异和驱动 bug 最多，需要完整 capability/workaround 系统。
+
+### 15.4 Wasm 路径
+
+Wasm + WebGPU 适合 C/C++ 引擎跑浏览器，但它不是“免费更快”。调用链可能包含：
+
+```text
+C/C++
+  → Wasm/Emscripten
+  → JS/WebGPU binding 或 emdawnwebgpu
+  → Browser WebGPU
+  → GPU process/backend
+```
+
+因此选择路径要看目标：Web app、Native tool、Node 工具、C++ 引擎 Web 移植各有不同。
+
+---
+
+## 16. 如果设计一套新的 RHI，应如何取舍
+
+### 16.1 小型/Web 优先引擎
+
+可以参考 LayaAir：
+
+- `IRenderEngine` + `IRenderDeviceFactory`；
+- `ITextureContext` 单独抽；
+- flat capability 起步；
+- WebGL 状态缓存；
+- Native bridge 透传。
+
+但要预留现代概念：BufferUsage、TextureUsage、PipelineLayout、CommandEncoder。
+
+### 16.2 中型跨平台引擎
+
+建议参考 Godot/wgpu：
+
+- Context/Surface 与 Device/Command 分离；
+- Resource opaque handle；
+- Driver/HAL 层薄化；
+- Core 层做 validation 和 resource tracking；
+- feature/limit/format/workaround 分层；
+- shader 编译链独立。
+
+### 16.3 大型商业引擎
+
+必须参考 UE5：
+
+- RHI 与 RenderGraph 分工；
+- CommandList 支持多线程；
+- PSO cache；
+- transient resource；
+- shader permutation 管理；
+- platform data-driven 配置；
+- validation/profiling/crash debugging；
+- asset cooking 与 runtime capability 关联。
+
+### 16.4 标准化/浏览器/多进程场景
+
+参考 Dawn：
+
+- API 描述 codegen；
+- client/server wire；
+- 严格 validation；
+- CTS；
+- toggles/workarounds；
+- C API/proc table；
+- shader compiler 与规范绑定。
+
+---
+
+## 17. 关键结论
+
+1. RHI 的难点不在“函数名统一”，而在统一 GPU 编程模型。
+2. 轻量引擎可以使用 GL 风格封装，但现代后端需要显式资源、pipeline、command 和 barrier。
+3. Feature 系统必须拆分为 feature、limit、format、trait、toggle、workaround、feature level、shader platform。
+4. Shader 编译器是 RHI 的核心基础设施，不是外挂工具。
+5. Barrier 最好不要完全交给用户；core tracking 和 RenderGraph 推导是两条主流路线。
+6. 大型引擎需要 RHI Thread、CommandList、PSO cache、Validation、GPU Profiler。
+7. 老引擎现代化通常会引入 PSO、ResourceSet、CommandList、DeviceManager，但历史宏和命名会长期存在。
+8. Dawn/wgpu 代表以 WebGPU 为中心的新一代标准化 RHI 思路。
+9. UE5 代表 RHI 与完整渲染生产系统结合后的工业级复杂度。
+10. 自研 RHI 应按引擎规模选择复杂度，不应盲目照搬 UE5，也不应把 WebGL 封装误认为完整现代 RHI。
+
+---
+
+## 18. 附：一套推荐的现代 RHI 分层草案
+
+```text
+Application / Renderer
+  ↓
+RenderGraph
+  - Pass declaration
+  - Resource lifetime
+  - Barrier inference
+  - Transient resource aliasing
+  ↓
+RHI Core
+  - Device
+  - Queue
+  - Resource handles
+  - Validation
+  - Usage tracking
+  - Capability database
+  ↓
+Shader System
+  - Source language
+  - IR
+  - Reflection
+  - Backend codegen
+  - Pipeline layout validation
+  ↓
+HAL / Backend
+  - Vulkan
+  - D3D12
+  - Metal
+  - WebGPU
+  - OpenGL/WebGL fallback
+  ↓
+Platform Layer
+  - Window
+  - Surface
+  - Swapchain
+  - Native handles
+```
+
+这套分层综合了 PDF 中多个系统的经验：
+
+- LayaAir 提醒我们轻量封装和平台 bridge 的实用性；
+- Godot 提醒我们 Context/Device/Driver 和 capability 分类的重要性；
+- wgpu 提醒我们 core validation 与 HAL 分离的重要性；
+- UE5 提醒我们 RenderGraph、多线程和 profiling 的必要性；
+- CryEngine 提醒我们历史架构现代化要循序渐进；
+- Dawn 提醒我们 codegen、CTS、Wire 和标准一致性在大型生态中的价值。
+
+最终，RHI 的设计目标不是让所有后端“看起来一样”，而是让上层渲染器可以在一致语义下表达资源、命令和依赖，同时允许底层针对不同 API 做高效、安全、可调试的实现。
