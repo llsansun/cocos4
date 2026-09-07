@@ -107,6 +107,7 @@ export class TerrainLod {
         }
 
         const levels = TERRAIN_LOD_LEVELS;
+        let totalSize = 0;
         for (let l = 0; l < levels; ++l) {
             for (let n = 0; n < levels; ++n) {
                 if (n < l) {
@@ -134,10 +135,24 @@ export class TerrainLod {
                             k.south = s;
                             k.west = w;
                             k.east = e;
-                            this._genIndexData(k);
+                            const data = this._genIndexData(k, totalSize);
+                            // Only count newly generated data — cache hits already counted in a prior iteration.
+                            if (data != null && data.start === totalSize) {
+                                totalSize += data.size;
+                            }
                         }
                     }
                 }
+            }
+        }
+
+        // Build the shared index buffer ONCE (O(n)). The previous code reallocated + copied
+        // `_indexBuffer` on every `_genIndexData` call (O(n^2)), which dominated LOD build time.
+        this._indexBuffer = new Uint16Array(totalSize);
+        for (let i = 0; i < this._indexMap.length; ++i) {
+            const data = this._indexMap[i];
+            if (data.buffer != null) {
+                this._indexBuffer.set(data.buffer, data.start);
             }
         }
     }
@@ -381,7 +396,7 @@ export class TerrainLod {
         return this._connecterIndexPool[TerrainLod.mapIndex(i, j, k)];
     }
 
-    private _genIndexData (k: TerrainLodKey): TerrainIndexData | null {
+    private _genIndexData (k: TerrainLodKey, start: number): TerrainIndexData | null {
         let data = this.getIndexData(k);
         if (data != null) {
             return data;
@@ -496,13 +511,8 @@ export class TerrainLod {
         }
 
         data.primCount = index / 3;
-        data.start = this._indexBuffer.length;
+        data.start = start;
         this._indexMap.push(data);
-
-        const temp = new Uint16Array(data.start + data.size);
-        temp.set(this._indexBuffer, 0);
-        temp.set(data.buffer, data.start);
-        this._indexBuffer = temp;
 
         return data;
     }

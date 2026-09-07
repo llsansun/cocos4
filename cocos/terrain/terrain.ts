@@ -34,7 +34,7 @@ import { Component } from '../scene-graph/component';
 import { CCObjectFlags, isValid } from '../core/data/object';
 import { director } from '../game/director';
 import { AttributeName, BufferUsageBit, Format, MemoryUsageBit, PrimitiveMode, Attribute, Buffer, BufferInfo, deviceManager, Texture } from '../gfx';
-import { clamp, Rect, Size, v3, Vec2, Vec3, Vec4 } from '../core/math';
+import { clamp, Rect, Size, v3, Vec3, Vec4 } from '../core/math';
 import { MacroRecord } from '../render-scene/core/pass-utils';
 import { Pass, scene } from '../render-scene';
 import { Camera } from '../render-scene/scene/camera';
@@ -45,12 +45,287 @@ import { TerrainLod, TerrainLodKey, TERRAIN_LOD_LEVELS, TERRAIN_LOD_MAX_DISTANCE
 import { TerrainAsset, TerrainLayerInfo, TERRAIN_HEIGHT_BASE, TERRAIN_HEIGHT_FACTORY,
     TERRAIN_BLOCK_TILE_COMPLEXITY, TERRAIN_BLOCK_VERTEX_SIZE, TERRAIN_BLOCK_VERTEX_COMPLEXITY,
     TERRAIN_MAX_LAYER_COUNT, TERRAIN_HEIGHT_FMIN, TERRAIN_HEIGHT_FMAX, TERRAIN_MAX_BLEND_LAYERS, TERRAIN_DATA_VERSION5 } from './terrain-asset';
-import { CCFloat } from '../core';
+import { CCFloat, error, log } from '../core';
 import { PipelineEventType } from '../rendering';
 import { MobilityMode, Node } from '../scene-graph';
+import { WorkerPool } from '../misc/worker-pool';
+import { getOptimalWorkerCount, isWorkerSupported } from '../misc/worker';
+import type { WorkerTask } from '../misc/worker';
 
 // the same as dependentAssets: legacy/terrain.effect
 const TERRAIN_EFFECT_UUID = '1d08ef62-a503-4ce2-8b9a-46c90873f7d3';
+
+// Self-contained worker task: compute normals for a range of y-rows.
+// Must not reference any engine objects or closure variables — serialized via fn.toString().
+const _terrainNormalsTask = function _terrainNormalsTask (
+    heights: Uint16Array,
+    startY: number,
+    endY: number,
+    vcX: number,
+    vcY: number,
+    tileSize: number,
+): Float32Array {
+    const BASE = 32768;
+    const FACTORY = 1.0 / 128.0;
+    const rowCount = endY - startY;
+    const result = new Float32Array(rowCount * vcX * 3);
+
+    // `heights` is a row-slice starting at global row `startY`; all reads are slice-relative.
+    for (let z = startY; z < endY; z++) {
+        const lz = z - startY;
+        for (let x = 0; x < vcX; x++) {
+            let flip = 1;
+            const hHere = (heights[lz * vcX + x] - BASE) * FACTORY;
+
+            let drx: number; let dry: number;
+            if (x < vcX - 1) {
+                drx = tileSize;
+                dry = (heights[lz * vcX + x + 1] - BASE) * FACTORY - hHere;
+            } else {
+                flip *= -1;
+                drx = -tileSize;
+                dry = (heights[lz * vcX + x - 1] - BASE) * FACTORY - hHere;
+            }
+
+            let duy: number; let duz: number;
+            if (z < vcY - 1) {
+                duy = (heights[(lz + 1) * vcX + x] - BASE) * FACTORY - hHere;
+                duz = tileSize;
+            } else {
+                flip *= -1;
+                duy = (heights[(lz - 1) * vcX + x] - BASE) * FACTORY - hHere;
+                duz = -tileSize;
+            }
+
+            // normal = up × right * flip  (up=(0,duy,duz), right=(drx,dry,0))
+            let nx = -duz * dry;
+            let ny = duz * drx;
+            let nz = -duy * drx;
+            nx *= flip; ny *= flip; nz *= flip;
+
+            const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+            if (len > 0) {
+                const inv = 1.0 / len;
+                nx *= inv; ny *= inv; nz *= inv;
+            }
+
+            const ri = ((z - startY) * vcX + x) * 3;
+            result[ri] = nx;
+            result[ri + 1] = ny;
+            result[ri + 2] = nz;
+        }
+    }
+
+    return result;
+};
+
+// Self-contained worker task: compute vertex data + bounding box for a batch of blocks.
+// Must not reference any engine objects or closure variables — serialized via fn.toString().
+const _terrainBlockDataTask = function _terrainBlockDataTask (
+    heightsSlice: Uint16Array,
+    normalsSlice: Float32Array,
+    startBlockRow: number,
+    endBlockRow: number,
+    startBlockCol: number,
+    blockCountX: number,
+    vcX: number,
+    tileSize: number,
+): { vertexData: Float32Array, bbData: Float32Array } {
+    const BASE = 32768;
+    const FACTORY = 1.0 / 128.0;
+    const TILE = 32;
+    const VERT = 33;
+    const VSIZE = 8;
+    const INV_TILE = 1.0 / TILE;
+
+    const numBlocks = (endBlockRow - startBlockRow) * blockCountX;
+    const vertsPerBlock = VERT * VERT * VSIZE;
+    const vertexData = new Float32Array(numBlocks * vertsPerBlock);
+    const bbData = new Float32Array(numBlocks * 6);
+
+    for (let blockRow = startBlockRow; blockRow < endBlockRow; blockRow++) {
+        for (let blockCol = 0; blockCol < blockCountX; blockCol++) {
+            const blockIdx = (blockRow - startBlockRow) * blockCountX + blockCol;
+            const vdBase = blockIdx * vertsPerBlock;
+
+            let bbMinX = Number.MAX_VALUE; let bbMinY = Number.MAX_VALUE; let bbMinZ = Number.MAX_VALUE;
+            let bbMaxX = -Number.MAX_VALUE; let bbMaxY = -Number.MAX_VALUE; let bbMaxZ = -Number.MAX_VALUE;
+
+            for (let j = 0; j < VERT; j++) {
+                for (let i = 0; i < VERT; i++) {
+                    const gx = (startBlockCol + blockCol) * TILE + i;
+                    const gy = blockRow * TILE + j;
+                    const localY = (blockRow - startBlockRow) * TILE + j;
+                    const hIdx = localY * vcX + gx;
+                    const height = (heightsSlice[hIdx] - BASE) * FACTORY;
+
+                    const px = gx * tileSize;
+                    const py = height;
+                    const pz = gy * tileSize;
+
+                    const nIdx = hIdx * 3;
+                    const vdIdx = vdBase + (j * VERT + i) * VSIZE;
+                    vertexData[vdIdx] = px;
+                    vertexData[vdIdx + 1] = py;
+                    vertexData[vdIdx + 2] = pz;
+                    vertexData[vdIdx + 3] = normalsSlice[nIdx];
+                    vertexData[vdIdx + 4] = normalsSlice[nIdx + 1];
+                    vertexData[vdIdx + 5] = normalsSlice[nIdx + 2];
+                    vertexData[vdIdx + 6] = i * INV_TILE;
+                    vertexData[vdIdx + 7] = j * INV_TILE;
+
+                    if (px < bbMinX) bbMinX = px;
+                    if (py < bbMinY) bbMinY = py;
+                    if (pz < bbMinZ) bbMinZ = pz;
+                    if (px > bbMaxX) bbMaxX = px;
+                    if (py > bbMaxY) bbMaxY = py;
+                    if (pz > bbMaxZ) bbMaxZ = pz;
+                }
+            }
+
+            const bbIdx = blockIdx * 6;
+            bbData[bbIdx] = bbMinX;
+            bbData[bbIdx + 1] = bbMinY;
+            bbData[bbIdx + 2] = bbMinZ;
+            bbData[bbIdx + 3] = bbMaxX;
+            bbData[bbIdx + 4] = bbMaxY;
+            bbData[bbIdx + 5] = bbMaxZ;
+        }
+    }
+
+    return { vertexData, bbData };
+};
+
+// Self-contained worker task: compute normals AND block data in one pass.
+// Each worker receives a heights slice, computes normals for its rows, then
+// uses those normals directly for block vertex data — eliminating the entire
+// normals round-trip (slice + transfer + merge) of the two-stage approach.
+const _terrainCombinedTask = function _terrainCombinedTask (
+    heightsSlice: Uint16Array,
+    sliceStartY: number,
+    startBlockRow: number,
+    endBlockRow: number,
+    blockCountX: number,
+    vcX: number,
+    vcY: number,
+    tileSize: number,
+): { normals: Float32Array, vertexData: Float32Array, bbData: Float32Array } {
+    const BASE = 32768;
+    const FACTORY = 1.0 / 128.0;
+    const TILE = 32;
+    const VERT = 33;
+    const VSIZE = 8;
+    const INV_TILE = 1.0 / TILE;
+
+    const numBlockRows = endBlockRow - startBlockRow;
+    // Normals needed for rows [0..numBlockRows*TILE] (inclusive) = numBlockRows*TILE+1 rows.
+    // The z+1 lookahead for the last row reads from row numBlockRows*TILE+1, which is
+    // available in the slice (slice has at least numBlockRows*TILE+32 rows).
+    const normalsRowCount = numBlockRows * TILE + 1;
+    const normals = new Float32Array(normalsRowCount * vcX * 3);
+
+    // --- Step 1: compute normals for this slice ---
+    for (let z = 0; z < normalsRowCount; z++) {
+        const globalZ = sliceStartY + z;
+        for (let x = 0; x < vcX; x++) {
+            let flip = 1;
+            const hHere = (heightsSlice[z * vcX + x] - BASE) * FACTORY;
+
+            let drx: number; let dry: number;
+            if (x < vcX - 1) {
+                drx = tileSize;
+                dry = (heightsSlice[z * vcX + x + 1] - BASE) * FACTORY - hHere;
+            } else {
+                flip *= -1;
+                drx = -tileSize;
+                dry = (heightsSlice[z * vcX + x - 1] - BASE) * FACTORY - hHere;
+            }
+
+            let duy: number; let duz: number;
+            if (globalZ < vcY - 1) {
+                duy = (heightsSlice[(z + 1) * vcX + x] - BASE) * FACTORY - hHere;
+                duz = tileSize;
+            } else {
+                flip *= -1;
+                duy = (heightsSlice[(z - 1) * vcX + x] - BASE) * FACTORY - hHere;
+                duz = -tileSize;
+            }
+
+            let nx = -duz * dry;
+            let ny = duz * drx;
+            let nz = -duy * drx;
+            nx *= flip; ny *= flip; nz *= flip;
+
+            const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+            if (len > 0) {
+                const inv = 1.0 / len;
+                nx *= inv; ny *= inv; nz *= inv;
+            }
+
+            const ri = (z * vcX + x) * 3;
+            normals[ri] = nx;
+            normals[ri + 1] = ny;
+            normals[ri + 2] = nz;
+        }
+    }
+
+    // --- Step 2: compute block data using the normals we just computed ---
+    const numBlocks = numBlockRows * blockCountX;
+    const vertsPerBlock = VERT * VERT * VSIZE;
+    const vertexData = new Float32Array(numBlocks * vertsPerBlock);
+    const bbData = new Float32Array(numBlocks * 6);
+
+    for (let blockRow = startBlockRow; blockRow < endBlockRow; blockRow++) {
+        for (let blockCol = 0; blockCol < blockCountX; blockCol++) {
+            const blockIdx = (blockRow - startBlockRow) * blockCountX + blockCol;
+            const vdBase = blockIdx * vertsPerBlock;
+
+            let bbMinX = Number.MAX_VALUE; let bbMinY = Number.MAX_VALUE; let bbMinZ = Number.MAX_VALUE;
+            let bbMaxX = -Number.MAX_VALUE; let bbMaxY = -Number.MAX_VALUE; let bbMaxZ = -Number.MAX_VALUE;
+
+            for (let j = 0; j < VERT; j++) {
+                for (let i = 0; i < VERT; i++) {
+                    const gx = blockCol * TILE + i;
+                    const localY = (blockRow - startBlockRow) * TILE + j;
+                    const hIdx = localY * vcX + gx;
+                    const height = (heightsSlice[hIdx] - BASE) * FACTORY;
+
+                    const px = gx * tileSize;
+                    const py = height;
+                    const pz = (blockRow * TILE + j) * tileSize;
+
+                    const nIdx = hIdx * 3;
+                    const vdIdx = vdBase + (j * VERT + i) * VSIZE;
+                    vertexData[vdIdx] = px;
+                    vertexData[vdIdx + 1] = py;
+                    vertexData[vdIdx + 2] = pz;
+                    vertexData[vdIdx + 3] = normals[nIdx];
+                    vertexData[vdIdx + 4] = normals[nIdx + 1];
+                    vertexData[vdIdx + 5] = normals[nIdx + 2];
+                    vertexData[vdIdx + 6] = i * INV_TILE;
+                    vertexData[vdIdx + 7] = j * INV_TILE;
+
+                    if (px < bbMinX) bbMinX = px;
+                    if (py < bbMinY) bbMinY = py;
+                    if (pz < bbMinZ) bbMinZ = pz;
+                    if (px > bbMaxX) bbMaxX = px;
+                    if (py > bbMaxY) bbMaxY = py;
+                    if (pz > bbMaxZ) bbMaxZ = pz;
+                }
+            }
+
+            const bbIdx = blockIdx * 6;
+            bbData[bbIdx] = bbMinX;
+            bbData[bbIdx + 1] = bbMinY;
+            bbData[bbIdx + 2] = bbMinZ;
+            bbData[bbIdx + 3] = bbMaxX;
+            bbData[bbIdx + 4] = bbMaxY;
+            bbData[bbIdx + 5] = bbMaxZ;
+        }
+    }
+
+    return { normals, vertexData, bbData };
+};
 
 /**
  * @en Terrain info
@@ -426,12 +701,20 @@ export class TerrainBlock {
         this._renderable = this._node.addComponent(TerrainRenderable);
     }
 
-    public build (): void {
+    public build (preData?: { vertexData: Float32Array, bbMin: Vec3, bbMax: Vec3 }): void {
         const gfxDevice = director.root!.device;
 
-        // vertex buffer
-        const vertexData = new Float32Array(TERRAIN_BLOCK_VERTEX_SIZE * TERRAIN_BLOCK_VERTEX_COMPLEXITY * TERRAIN_BLOCK_VERTEX_COMPLEXITY);
-        this._buildVertexData(vertexData);
+        let vertexData: Float32Array;
+        if (preData) {
+            vertexData = preData.vertexData;
+            this._bbMin.set(preData.bbMin);
+            this._bbMax.set(preData.bbMax);
+        } else {
+            const data = this._computeBlockData();
+            vertexData = data.vertexData;
+            this._bbMin.set(data.bbMin);
+            this._bbMax.set(data.bbMax);
+        }
         const vertexBuffer = gfxDevice.createBuffer(new BufferInfo(
             BufferUsageBit.VERTEX | BufferUsageBit.TRANSFER_DST,
             MemoryUsageBit.DEVICE,
@@ -439,9 +722,6 @@ export class TerrainBlock {
             TERRAIN_BLOCK_VERTEX_SIZE * Float32Array.BYTES_PER_ELEMENT,
         ));
         vertexBuffer.update(vertexData);
-
-        // build bounding box
-        this._buildBoundingBox();
 
         // initialize renderable
         const gfxAttributes: Attribute[] = [
@@ -655,10 +935,9 @@ export class TerrainBlock {
      * @engineInternal
      */
     public _buildLodInfo (): void {
-        const vertexData = new Float32Array(TERRAIN_BLOCK_VERTEX_SIZE * TERRAIN_BLOCK_VERTEX_COMPLEXITY * TERRAIN_BLOCK_VERTEX_COMPLEXITY);
-        this._buildVertexData(vertexData);
+        const data = this._computeBlockData();
         // update lod
-        this._updateLodBuffer(vertexData);
+        this._updateLodBuffer(data.vertexData);
         // update index buffer
         this._updateIndexBuffer();
     }
@@ -899,16 +1178,24 @@ export class TerrainBlock {
         }
     }
 
-    public _updateHeight (): void {
+    public _updateHeight (preData?: { vertexData: Float32Array, bbMin: Vec3, bbMax: Vec3 }): void {
         if (this._renderable._meshData == null) {
             return;
         }
 
-        const vertexData = new Float32Array(TERRAIN_BLOCK_VERTEX_SIZE * TERRAIN_BLOCK_VERTEX_COMPLEXITY * TERRAIN_BLOCK_VERTEX_COMPLEXITY);
-        this._buildVertexData(vertexData);
+        let vertexData: Float32Array;
+        if (preData) {
+            vertexData = preData.vertexData;
+            this._bbMin.set(preData.bbMin);
+            this._bbMax.set(preData.bbMax);
+        } else {
+            const data = this._computeBlockData();
+            vertexData = data.vertexData;
+            this._bbMin.set(data.bbMin);
+            this._bbMax.set(data.bbMax);
+        }
         this._renderable._meshData.vertexBuffers[0].update(vertexData);
 
-        this._buildBoundingBox();
         this._renderable._model!.createBoundingShape(this._bbMin, this._bbMax);
         this._renderable._model!.updateWorldBound();
 
@@ -1159,39 +1446,24 @@ export class TerrainBlock {
         }
     }
 
-    private _buildVertexData (vertexData: Float32Array): void {
-        let index = 0;
-        for (let j = 0; j < TERRAIN_BLOCK_VERTEX_COMPLEXITY; ++j) {
-            for (let i = 0; i < TERRAIN_BLOCK_VERTEX_COMPLEXITY; ++i) {
-                const x = this._index[0] * TERRAIN_BLOCK_TILE_COMPLEXITY + i;
-                const y = this._index[1] * TERRAIN_BLOCK_TILE_COMPLEXITY + j;
-                const position = this._terrain.getPosition(x, y);
-                const normal = this._terrain.getNormal(x, y);
-                const uv = new Vec2(i / TERRAIN_BLOCK_TILE_COMPLEXITY, j / TERRAIN_BLOCK_TILE_COMPLEXITY);
-                vertexData[index++] = position.x;
-                vertexData[index++] = position.y;
-                vertexData[index++] = position.z;
-                vertexData[index++] = normal.x;
-                vertexData[index++] = normal.y;
-                vertexData[index++] = normal.z;
-                vertexData[index++] = uv.x;
-                vertexData[index++] = uv.y;
-            }
-        }
-    }
+    private _computeBlockData (): { vertexData: Float32Array, bbMin: Vec3, bbMax: Vec3 } {
+        const terrain = this._terrain;
+        const vcX = terrain.vertexCount[0];
+        const tileSize = terrain.tileSize;
+        const blockCol = this._index[0];
+        const blockRow = this._index[1];
 
-    private _buildBoundingBox (): void {
-        this._bbMin.set(Number.MAX_VALUE, Number.MAX_VALUE, Number.MAX_VALUE);
-        this._bbMax.set(Number.MIN_VALUE, Number.MIN_VALUE, Number.MIN_VALUE);
-        for (let j = 0; j < TERRAIN_BLOCK_VERTEX_COMPLEXITY; ++j) {
-            for (let i = 0; i < TERRAIN_BLOCK_VERTEX_COMPLEXITY; ++i) {
-                const x = this._index[0] * TERRAIN_BLOCK_TILE_COMPLEXITY + i;
-                const y = this._index[1] * TERRAIN_BLOCK_TILE_COMPLEXITY + j;
-                const position = this._terrain.getPosition(x, y);
-                Vec3.min(this._bbMin, this._bbMin, position);
-                Vec3.max(this._bbMax, this._bbMax, position);
-            }
-        }
+        const sliceStart = blockRow * TERRAIN_BLOCK_TILE_COMPLEXITY * vcX;
+        const sliceEnd = Math.min(sliceStart + TERRAIN_BLOCK_VERTEX_COMPLEXITY * vcX, terrain.heights.length);
+        const heightsSlice = terrain.heights.subarray(sliceStart, sliceEnd);
+        const normalsSlice = terrain.normals.subarray(sliceStart * 3, sliceEnd * 3);
+
+        const result = _terrainBlockDataTask(heightsSlice, normalsSlice, blockRow, blockRow + 1, blockCol, 1, vcX, tileSize);
+        return {
+            vertexData: result.vertexData,
+            bbMin: new Vec3(result.bbData[0], result.bbData[1], result.bbData[2]),
+            bbMax: new Vec3(result.bbData[3], result.bbData[4], result.bbData[5]),
+        };
     }
 }
 
@@ -1517,6 +1789,14 @@ export class Terrain extends Component {
     }
 
     /**
+     * @en get normal buffer
+     * @zh 获得法线缓存
+     */
+    get normals (): Float32Array {
+        return this._normals;
+    }
+
+    /**
      * @en get weight buffer
      * @zh 获得权重缓存
      */
@@ -1610,6 +1890,61 @@ export class Terrain extends Component {
     }
 
     /**
+     * @en Async rebuild using Web Workers for normals and block-data computation.
+     * Falls back to single-threaded when workers are unavailable.
+     * @zh 异步重建地形，使用 Web Worker 并行计算法线和顶点数据。无 worker 时回退单线程。
+     */
+    public async rebuildAsync (info: TerrainInfo): Promise<void> {
+        for (let i = 0; i < this._blocks.length; ++i) {
+            this._blocks[i].destroy();
+        }
+        this._blocks = [];
+
+        // reset lightmap
+        this._resetLightmap(false);
+
+        // build layer buffer
+        this._rebuildLayerBuffer(info);
+
+        // build heights and normals
+        const heightsChanged = this._rebuildHeights(info);
+
+        // build weights
+        this._rebuildWeights(info);
+
+        // update info
+        this._tileSize = info.tileSize;
+        this._blockCount[0] = info.blockCount[0];
+        this._blockCount[1] = info.blockCount[1];
+        this._weightMapSize = info.weightMapSize;
+        this._lightMapSize = info.lightMapSize;
+
+        // build normals if heights changed
+        if (heightsChanged) {
+            this._normals = new Float32Array(this.heights.length * 3);
+        }
+
+        // build blocks
+        for (let j = 0; j < this._blockCount[1]; ++j) {
+            for (let i = 0; i < this._blockCount[0]; ++i) {
+                this._blocks.push(new TerrainBlock(this, i, j));
+            }
+        }
+
+        // Combined: normals + block data in one worker round (no normals round-trip)
+        if (heightsChanged) {
+            const blockData = await this._buildNormalsAndBlocksDataAsync();
+            for (let i = 0; i < this._blocks.length; ++i) {
+                this._blocks[i].build(blockData?.get(i));
+            }
+        } else {
+            for (let i = 0; i < this._blocks.length; ++i) {
+                this._blocks[i].build();
+            }
+        }
+    }
+
+    /**
      * @en import height field
      * @zh 导入高度图
      */
@@ -1631,6 +1966,31 @@ export class Terrain extends Component {
         // rebuild all blocks
         for (let i = 0; i < this._blocks.length; ++i) {
             this._blocks[i]._updateHeight();
+        }
+    }
+
+    /**
+     * @en Async import height field using Web Workers for normals and block-data computation.
+     * Falls back to single-threaded when workers are unavailable.
+     * @zh 异步导入高度图，使用 Web Worker 并行计算法线和顶点数据。无 worker 时回退单线程。
+     */
+    public async importHeightFieldAsync (hf: HeightField, heightScale: number): Promise<void> {
+        let index = 0;
+        for (let j = 0; j < this.vertexCount[1]; ++j) {
+            for (let i = 0; i < this.vertexCount[0]; ++i) {
+                const u = i / this.tileCount[0];
+                const v = j / this.tileCount[1];
+
+                const h = hf.getAt(u * hf.w, v * hf.h) * heightScale;
+
+                this._heights[index++] = h;
+            }
+        }
+
+        // Combined: normals + block data in one worker round (no normals round-trip)
+        const blockData = await this._buildNormalsAndBlocksDataAsync();
+        for (let i = 0; i < this._blocks.length; ++i) {
+            this._blocks[i]._updateHeight(blockData?.get(i));
         }
     }
 
@@ -1740,6 +2100,10 @@ export class Terrain extends Component {
         if (this._sharedLodIndexBuffer != null) {
             this._sharedLodIndexBuffer.destroy();
         }
+
+        // destroy worker pool
+        this._combinedWorkerPool?.terminate();
+        this._combinedWorkerPool = null;
     }
 
     public onRestore (): void {
@@ -2360,56 +2724,126 @@ export class Terrain extends Component {
         return index < this._lightmapInfos.length ? this._lightmapInfos[index] : null;
     }
 
+    private _combinedWorkerPool: WorkerPool | null = null;
+
+    private _getCombinedWorkerPool (): WorkerPool {
+        if (!this._combinedWorkerPool) {
+            this._combinedWorkerPool = new WorkerPool(_terrainCombinedTask as unknown as WorkerTask, {
+                maxWorkers: getOptimalWorkerCount(),
+                idleReleaseAfter: 5000,
+            });
+        }
+        return this._combinedWorkerPool;
+    }
+
     /**
-     * @deprecated since v3.5.0, this is an engine private interface that will be removed in the future.
+     * Combined async: compute normals AND block data in a single worker round.
+     * Each worker receives a heights slice, computes normals for its rows, then
+     * uses those normals directly for block vertex data — eliminating the entire
+     * normals round-trip (slice + transfer + merge) of the two-stage approach.
      */
-    public _calcNormal (x: number, z: number): Vec3 {
-        let flip = 1;
-        const here = this.getPosition(x, z);
-        let right: Vec3;
-        let up: Vec3;
+    private async _buildNormalsAndBlocksDataAsync ():
+        Promise<Map<number, { vertexData: Float32Array, bbMin: Vec3, bbMax: Vec3 }> | null> {
+        const vcX = this.vertexCount[0];
+        const vcY = this.vertexCount[1];
+        const tileSize = this._tileSize;
+        const blockCountX = this._blockCount[0];
+        const blockCountY = this._blockCount[1];
+        const heights = this._heights;
 
-        if (x < this.vertexCount[0] - 1) {
-            right = this.getPosition(x + 1, z);
-        } else {
-            flip *= -1;
-            right = this.getPosition(x - 1, z);
+        const workerCount = getOptimalWorkerCount();
+        log(`[Terrain] _buildNormalsAndBlocksDataAsync: blockCount=${blockCountX}x${blockCountY} vcX=${vcX} vcY=${vcY} workerCount=${workerCount} isWorkerSupported=${isWorkerSupported()}`);
+        if (workerCount <= 1) {
+            // Single-threaded fallback: compute normals + block data synchronously
+            this._buildNormals();
+            return null;
         }
 
-        if (z < this.vertexCount[1] - 1) {
-            up = this.getPosition(x, z + 1);
-        } else {
-            flip *= -1;
-            up = this.getPosition(x, z - 1);
+        try {
+            const pool = this._getCombinedWorkerPool();
+            const rowsPerWorker = Math.ceil(blockCountY / workerCount);
+
+            const promises: Promise<{ normals: Float32Array, vertexData: Float32Array, bbData: Float32Array }>[] = [];
+            const ranges: { startRow: number, endRow: number, sliceStartY: number }[] = [];
+
+            const tSlice = performance.now();
+            for (let w = 0; w < workerCount; w++) {
+                const startRow = w * rowsPerWorker;
+                const endRow = Math.min(startRow + rowsPerWorker, blockCountY);
+                if (startRow >= endRow) break;
+
+                const sliceStartY = startRow * TERRAIN_BLOCK_TILE_COMPLEXITY;
+                const sliceEndY = Math.min(
+                    endRow * TERRAIN_BLOCK_TILE_COMPLEXITY + TERRAIN_BLOCK_TILE_COMPLEXITY,
+                    vcY,
+                );
+                // slice() (copy) not subarray() (view) — subarray shares the underlying
+                // ArrayBuffer, so postMessage structured-clones the ENTIRE buffer.
+                // slice() creates a standalone buffer; combined with transfer it's zero-copy.
+                const heightsSlice = heights.slice(sliceStartY * vcX, sliceEndY * vcX);
+
+                ranges.push({ startRow, endRow, sliceStartY });
+                promises.push(pool.run<{ normals: Float32Array, vertexData: Float32Array, bbData: Float32Array }>(
+                    [heightsSlice, sliceStartY, startRow, endRow, blockCountX, vcX, vcY, tileSize],
+                    [heightsSlice.buffer],
+                ));
+            }
+            log(`[Terrain] _buildNormalsAndBlocksDataAsync: ${promises.length} workers dispatched, slice took ${(performance.now() - tSlice).toFixed(1)}ms`);
+
+            const tAwait = performance.now();
+            const results = await Promise.all(promises);
+            log(`[Terrain] _buildNormalsAndBlocksDataAsync: workers done in ${(performance.now() - tAwait).toFixed(1)}ms`);
+
+            // Merge normals back into this._normals
+            const tMerge = performance.now();
+            for (let r = 0; r < results.length; r++) {
+                const { sliceStartY } = ranges[r];
+                this._normals.set(results[r].normals, sliceStartY * vcX * 3);
+            }
+
+            // Build block data map
+            const blockData = new Map<number, { vertexData: Float32Array, bbMin: Vec3, bbMax: Vec3 }>();
+            const vertsPerBlock = TERRAIN_BLOCK_VERTEX_COMPLEXITY * TERRAIN_BLOCK_VERTEX_COMPLEXITY * TERRAIN_BLOCK_VERTEX_SIZE;
+
+            for (let r = 0; r < results.length; r++) {
+                const result = results[r];
+                const { startRow, endRow } = ranges[r];
+
+                for (let blockRow = startRow; blockRow < endRow; blockRow++) {
+                    for (let blockCol = 0; blockCol < blockCountX; blockCol++) {
+                        const localBlockIdx = (blockRow - startRow) * blockCountX + blockCol;
+                        const globalBlockIdx = blockRow * blockCountX + blockCol;
+
+                        const vdStart = localBlockIdx * vertsPerBlock;
+                        const vertexData = result.vertexData.subarray(vdStart, vdStart + vertsPerBlock);
+
+                        const bbStart = localBlockIdx * 6;
+                        const bbMin = new Vec3(result.bbData[bbStart], result.bbData[bbStart + 1], result.bbData[bbStart + 2]);
+                        const bbMax = new Vec3(result.bbData[bbStart + 3], result.bbData[bbStart + 4], result.bbData[bbStart + 5]);
+
+                        blockData.set(globalBlockIdx, { vertexData, bbMin, bbMax });
+                    }
+                }
+            }
+            log(`[Terrain] _buildNormalsAndBlocksDataAsync: merge took ${(performance.now() - tMerge).toFixed(1)}ms`);
+
+            return blockData;
+        } catch (e) {
+            error('[Terrain] combined worker failed, falling back to single-threaded:', e);
+            this._buildNormals();
+            return null;
         }
-
-        right.subtract(here);
-        up.subtract(here);
-
-        const normal = v3();
-        normal.set(up);
-        normal.cross(right);
-        normal.multiplyScalar(flip);
-        normal.normalize();
-
-        return normal;
     }
 
     /**
      * @deprecated since v3.5.0, this is an engine private interface that will be removed in the future.
      */
     public _buildNormals (): void {
-        let index = 0;
-        for (let y = 0; y < this.vertexCount[1]; ++y) {
-            for (let x = 0; x < this.vertexCount[0]; ++x) {
-                const n = this._calcNormal(x, y);
-
-                this._normals[index * 3 + 0] = n.x;
-                this._normals[index * 3 + 1] = n.y;
-                this._normals[index * 3 + 2] = n.z;
-                index += 1;
-            }
-        }
+        const vcX = this.vertexCount[0];
+        const vcY = this.vertexCount[1];
+        const tileSize = this._tileSize;
+        const result = _terrainNormalsTask(this._heights, 0, vcY, vcX, vcY, tileSize);
+        this._normals.set(result, 0);
     }
 
     private _buildImp (restore = false): void {
