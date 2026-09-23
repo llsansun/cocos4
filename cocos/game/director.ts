@@ -41,6 +41,7 @@ import { assetManager } from '../asset/asset-manager';
 import { deviceManager } from '../gfx';
 import { releaseManager } from '../asset/asset-manager/release-manager';
 import type { Game } from './game';
+import { traceRuntime } from './trace/trace';
 
 // ----------------------------------------------------------------------------------------------------------------------
 
@@ -765,6 +766,24 @@ export class Director extends EventTarget {
      * @param dt Delta time in seconds
      */
     public tick (dt: number): void {
+        if (traceRuntime.replaying) return;
+        if (!traceRuntime.recording || this._invalid) {
+            this._tick(dt);
+            return;
+        }
+        traceRuntime.beginFrame(dt);
+        try {
+            this._tick(dt);
+            traceRuntime.boundary('endFrame');
+        } catch (error) {
+            traceRuntime.recordError(error);
+            throw error;
+        } finally {
+            traceRuntime.flush();
+        }
+    }
+
+    private _tick (dt: number): void {
         if (!this._invalid) {
             this.emit(DirectorEvent.BEGIN_FRAME);
             if (!EDITOR_NOT_IN_PREVIEW) {
@@ -787,6 +806,7 @@ export class Director extends EventTarget {
                 // User can use this event to do things after update
                 this.emit(DirectorEvent.AFTER_UPDATE);
                 // Destroy entities that have been removed recently
+                traceRuntime.boundary('deferredDestroy');
                 CCObject._deferredDestroy();
 
                 // Post update systems

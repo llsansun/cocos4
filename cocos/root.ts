@@ -22,6 +22,7 @@
  THE SOFTWARE.
 */
 
+import { traceRuntime } from './game/trace/trace';
 import { USE_XR } from 'internal:constants';
 import { Pool, cclegacy, warnID, settings, macro, log, errorID, SettingsCategory, debug } from './core';
 import { DebugView } from './rendering/debug-view';
@@ -791,15 +792,15 @@ export class Root {
         const { director, Director } = cclegacy;
         const cameraList = this._cameraList;
         if (this._pipeline && cameraList.length > 0) {
-            director.emit(Director.EVENT_BEFORE_COMMIT);
+            if (!traceRuntime.replaying) director.emit(Director.EVENT_BEFORE_COMMIT);
             cameraList.sort((a: Camera, b: Camera): number => a.priority - b.priority);
 
             for (let i = 0; i < cameraList.length; ++i) {
                 cameraList[i].geometryRenderer?.update();
             }
-            director.emit(Director.EVENT_BEFORE_RENDER);
+            if (!traceRuntime.replaying) director.emit(Director.EVENT_BEFORE_RENDER);
             this._pipeline.render(cameraList);
-            director.emit(Director.EVENT_AFTER_RENDER);
+            if (!traceRuntime.replaying) director.emit(Director.EVENT_AFTER_RENDER);
             this._device.present();
         }
 

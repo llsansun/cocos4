@@ -1,0 +1,10 @@
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const project = process.argv[2];
+if (!project || !fs.existsSync(path.join(project, 'package.json'))) throw new Error('Usage: node scripts/trace/install-creator-extension.cjs <Creator project directory>');
+const target = path.resolve(project, 'extensions/cocos-trace-marker');
+if (fs.existsSync(target)) throw new Error(`Extension already exists; inspect before updating: ${target}`);
+fs.mkdirSync(target, { recursive: true });
+for (const file of ['package.json', 'builder.js', 'hooks.js']) fs.copyFileSync(path.join(__dirname, 'creator-extension', file), path.join(target, file), fs.constants.COPYFILE_EXCL);
+console.log(`Installed ${target}. Enable cocos-trace-marker in Creator Extension Manager, then rebuild.`);

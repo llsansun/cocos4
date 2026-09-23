@@ -1,0 +1,7 @@
+{
+  "name": "cocos-trace-marker",
+  "version": "1.0.0",
+  "package_version": 2,
+  "description": "Carry the project trace switch into Web and WeChat builds",
+  "contributions": { "builder": "./builder.js" }
+}

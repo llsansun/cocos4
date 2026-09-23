@@ -29,6 +29,7 @@ import { NodeUIProperties } from './node-ui-properties';
 import { cclegacy } from '../core/global-exports';
 import { nodePolyfill } from './node-dev';
 import { ISchedulable } from '../core/scheduler';
+import { traceRuntime } from '../game/trace/trace';
 import { approx, EPSILON, Mat3, mat4, Mat4, quat, Quat, v3, Vec3 } from '../core/math';
 import { MobilityMode, NodeSpace, TransformBit } from './node-enum';
 import { CustomSerializable, editorExtrasTag, SerializationContext, SerializationOutput, serializeTag } from '../core/data';
@@ -1657,6 +1658,7 @@ export class Node extends CCObject implements ISchedulable, CustomSerializable {
         this._rot = new Quat();
         this._scale = new Vec3(1, 1, 1);
         this._mat = new Mat4();
+        if (traceRuntime.recording && new.target === Node) traceRuntime.constructed('Node', this, [name]);
     }
 
     /**

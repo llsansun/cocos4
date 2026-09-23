@@ -43,6 +43,8 @@ import { bindingMappingInfo } from '../rendering/define';
 import { ICustomJointTextureLayout } from '../3d/skeletal-animation/skeletal-animation-utils';
 import { IPhysicsConfig } from '../physics/framework/physics-config';
 import { effectSettings } from '../core/effect-settings';
+import { configureSceneTrace, SceneTraceOptions } from './trace/scene-trace';
+import { resolveSceneTraceOptions } from './trace/trace-auto';
 
 const querySettings = settings.querySettings.bind(settings);
 
@@ -53,6 +55,9 @@ const querySettings = settings.querySettings.bind(settings);
  * Game configuration.
  */
 export interface IGameConfig {
+    /** Scene/API diagnostics. Undefined probes trace.txt on Web/WeChat; false disables probing. */
+    trace?: boolean | SceneTraceOptions;
+
     /**
      * @zh
      * 引擎配置文件路径
@@ -734,7 +739,8 @@ export class Game extends EventTarget {
     public init (config: IGameConfig): Promise<void> {
         this._compatibleWithOldParams(config);
         // DONT change the order unless you know what's you doing
-        return Promise.resolve()
+        return resolveSceneTraceOptions(config.trace, !EDITOR && !TEST && !NATIVE && !NODEJS)
+            .then((traceOptions): void => configureSceneTrace(traceOptions))
             // #region Base
             .then((): Promise<void[]> => {
                 this.emit(Game.EVENT_PRE_BASE_INIT);
