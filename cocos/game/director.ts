@@ -27,7 +27,7 @@
 
 /* spell-checker:words COORD, Quesada, INITED, Renerer */
 
-import { DEBUG, EDITOR, BUILD, TEST, EDITOR_NOT_IN_PREVIEW } from 'internal:constants';
+import { SCENE_TRACE, DEBUG, EDITOR, BUILD, TEST, EDITOR_NOT_IN_PREVIEW } from 'internal:constants';
 import { SceneAsset } from '../asset/assets/scene-asset';
 import { System, EventTarget, Scheduler, js, errorID, error, assertID, warnID, macro, CCObject, CCObjectFlags, cclegacy, isValid } from '../core';
 import { input } from '../input';
@@ -41,7 +41,7 @@ import { assetManager } from '../asset/asset-manager';
 import { deviceManager } from '../gfx';
 import { releaseManager } from '../asset/asset-manager/release-manager';
 import type { Game } from './game';
-import { traceRuntime } from './trace/trace';
+import { traceHooks } from './trace-hooks';
 
 // ----------------------------------------------------------------------------------------------------------------------
 
@@ -766,6 +766,8 @@ export class Director extends EventTarget {
      * @param dt Delta time in seconds
      */
     public tick (dt: number): void {
+        if (!SCENE_TRACE || !traceHooks.runtime) { this._tick(dt); return; }
+        const traceRuntime = traceHooks.runtime;
         if (traceRuntime.replaying) return;
         if (!traceRuntime.recording || this._invalid) {
             this._tick(dt);
@@ -806,7 +808,7 @@ export class Director extends EventTarget {
                 // User can use this event to do things after update
                 this.emit(DirectorEvent.AFTER_UPDATE);
                 // Destroy entities that have been removed recently
-                traceRuntime.boundary('deferredDestroy');
+                if (SCENE_TRACE) traceHooks.runtime?.boundary('deferredDestroy');
                 CCObject._deferredDestroy();
 
                 // Post update systems

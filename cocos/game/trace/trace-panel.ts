@@ -49,6 +49,10 @@ export function createSceneTracePanel (
     list.setAttribute('aria-label', '命令列表');
     list.style.cssText = 'max-height:240px;overflow:auto';
     const pageInfo = document.createElement('span');
+    const pageInput = document.createElement('input');
+    pageInput.type = 'number'; pageInput.min = '1'; pageInput.value = '1';
+    pageInput.setAttribute('aria-label', '跳转页码');
+    pageInput.style.cssText = 'width:60px;margin:4px';
     const filter = document.createElement('input');
     filter.placeholder = '搜索 API 名称或指令编号';
     filter.setAttribute('aria-label', '搜索命令');
@@ -58,12 +62,16 @@ export function createSceneTracePanel (
         const query = filter.value.trim().toLowerCase();
         const matches = commands.filter((command) => !query || command.api.toLowerCase().includes(query) || String(command.index) === query);
         page = Math.max(0, Math.min(page, Math.ceil(matches.length / pageSize) - 1));
+        pageInput.max = String(Math.max(1, Math.ceil(matches.length / pageSize)));
+        pageInput.value = String(page + 1);
         pageInfo.textContent = ` ${page + 1}/${Math.max(1, Math.ceil(matches.length / pageSize))} 页 · ${matches.length} 条 `;
         for (const command of matches.slice(page * pageSize, (page + 1) * pageSize)) {
             const row = document.createElement('button');
-            row.textContent = `${breakpoints.has(command.index) ? '● ' : ''}#${command.index} · 帧 ${command.frame} · ${command.api}`;
+            const frameStart = command.index === 0 || commands[command.index - 1]?.frame !== command.frame;
+            if (frameStart) row.dataset.frameStart = 'true';
+            row.textContent = `${breakpoints.has(command.index) ? '● ' : ''}#${command.index} · 帧 ${command.frame}${frameStart ? ' 开始' : ''} · ${command.api}`;
             row.setAttribute('aria-pressed', String(command.index === selected));
-            row.style.cssText = `display:block;width:100%;text-align:left;padding:5px;color:inherit;border:0;cursor:pointer;background:${command.index === selected ? '#345878' : 'transparent'}`;
+            row.style.cssText = `display:block;width:100%;text-align:left;padding:5px;color:${frameStart ? '#ff7676' : 'inherit'};border:0;cursor:pointer;background:${command.index === selected ? '#345878' : 'transparent'}`;
             row.onclick = (): void => { selected = command.index; show(); };
             list.appendChild(row);
         }
@@ -282,6 +290,20 @@ export function createSceneTracePanel (
     panel.appendChild(filter);
     button('命令上一页', () => { --page; }); panel.appendChild(pageInfo);
     button('命令下一页', () => { ++page; });
+    panel.appendChild(pageInput);
+    const jumpPage = (): void => {
+        const requested = Number(pageInput.value);
+        if (!Number.isInteger(requested) || requested < 1 || requested > Number(pageInput.max)) {
+            throw new Error(`页码必须是 1 到 ${pageInput.max} 之间的整数`);
+        }
+        page = requested - 1;
+    };
+    button('跳转页码', jumpPage);
+    pageInput.onkeydown = (event): void => {
+        if (event.key === 'Enter') {
+            try { jumpPage(); message.textContent = ''; show(); } catch (error) { message.textContent = String(error); }
+        }
+    };
     panel.appendChild(list);
     button('跳转到所选指令', async () => { if (selected < 0) throw new Error('请先选择指令'); await seek(selected); });
     button('运行到所选指令前', async () => {

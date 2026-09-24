@@ -171,3 +171,14 @@ python3 -m http.server 8774 --bind 127.0.0.1 --directory /private/tmp/scene-trac
 这里调试的是当前引擎执行录制指令时的状态，不能还原原游戏业务脚本调用栈、Worker 内部执行栈或远端崩溃时的内存。旧版 JSON 的后退需要调用方提供 `prepareReplay` 重载原始场景；两文件格式可直接重建。
 
 `TraceReplay` 组件也提供异步 `seekCommand(index)`、`previousCommand()`、`previousFrame()`；`seekCommand(-1)` 返回起始快照。
+
+## 构建裁剪与运行开关
+
+Trace 是独立的 `scene-trace` 构建 feature，默认关闭。Creator 使用当前自定义引擎时，重启编辑器以重新加载引擎模块注册表，然后在“项目设置 → 引擎管理器 → 功能裁剪”对应配置中勾选“场景 Trace（诊断录制）”，再重新构建。仅手改 includeModules 而没有编辑器模块注册表时，Creator 会过滤掉此项。正常发布的 features 不包含它时，`SCENE_TRACE=false`，核心仅有受编译常量保护的桥接点；不会导入录制器、存储 Worker、面板或 TraceReplay 组件，也不会探测 trace.txt。
+诊断构建需要在引擎构建 features 中包含 `scene-trace`，随后用 trace.txt 或 game.init 的 trace 选项启动录制。仅将运行时 `trace` 设为 false 不会裁掉已构建进去的模块。`scripts/trace/build-demo.cjs` 和 `build-project-demo.cjs` 会主动启用这个模块。Creator 的 marker 扩展仅负责复制开关文件，不能代替引擎模块选择。
+
+命令列表支持输入页码后点“跳转页码”或按 Enter。每一帧的第一条指令显示红色并标记“开始”；分页或搜索不会将普通行误标为帧首。
+
+## 全 API 覆盖进度
+
+当前仍是节点、选定 UI 和 3D 组件的诊断子集，不能宣称全 API 已完成。`node scripts/trace/audit-api.cjs /private/tmp/trace-api-inventory.json` 可生成源码接口候选清单（包含内部导出类，不等同于 cc 对外 API 数量）。逐项验收必须同时覆盖调用录制、参数/返回值编码、初始状态及资源恢复、真实场景回放。普通字段原地修改、回调及 Promise 完成、动态资源、物理/动画内部状态、网络/输入和业务脚本执行链仍需专项适配；不能通过移除白名单或静默跳过错误来宣布支持。

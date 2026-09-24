@@ -72,3 +72,25 @@ test('command list selection, seek, rewind and playback breakpoint use inclusive
         expect(document.body.textContent).toContain('已停在断点 #1 执行前');
     } finally { runtime.dispose(); localStorage.removeItem('test-navigation'); }
 });
+
+test('page number input jumps within filtered pages and marks actual frame starts', async () => {
+    const scene = require('../../cocos/game/trace/scene-trace');
+    const commands = Array.from({ length: 165 }, (_, index) => ({ index, frame: Math.floor(index / 50), kind: 'call', target: 'node', api: 'Node.setPosition', args: [] }));
+    jest.spyOn(scene, 'openSceneTrace').mockReturnValue({ file: { commands }, cursor: 0 });
+    localStorage.setItem('test-pages', '{}');
+    try {
+        dispose = createSceneTracePanel(document.body, '', { storageKey: 'test-pages' });
+        click('加载本机记录'); await settle();
+        const input = document.querySelector('[aria-label="跳转页码"]') as HTMLInputElement;
+        expect(input.max).toBe('3');
+        input.value = '2'; click('跳转页码'); await settle();
+        const list = document.querySelector('[aria-label="命令列表"]')!;
+        expect(list.textContent).toContain('#80');
+        expect(list.querySelector('[data-frame-start="true"]')?.textContent).toContain('#100 · 帧 2 开始');
+        expect(list.firstElementChild?.getAttribute('data-frame-start')).toBeNull();
+        input.value = '3'; input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }));
+        expect(list.children.length).toBe(5);
+        input.value = '4'; click('跳转页码'); await settle();
+        expect(document.body.textContent).toContain('页码必须是 1 到 3');
+    } finally { localStorage.removeItem('test-pages'); }
+});

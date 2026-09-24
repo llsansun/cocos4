@@ -28,12 +28,3 @@ import './splash-screen';
 
 export * from './director';
 export * from './game';
-
-export * from './trace/trace';
-export * from './trace/scene-trace';
-export * from './trace/trace-panel';
-export * from './trace/trace-archive';
-
-export * from './trace/trace-storage';
-export * from './trace/trace-auto';
-export * from './trace/trace-replay';

@@ -1,6 +1,10 @@
 {
     "$schema": "./cc.config.schema.json",
     "features": {
+        "scene-trace": {
+            "modules": ["scene-trace"],
+            "overrideConstants": { "SCENE_TRACE": true }
+        },
         "base": {
             "modules": ["base"],
             "dependentAssets": [
@@ -509,6 +513,10 @@
     ],
 
     "constants": {
+        "SCENE_TRACE": {
+            "comment": "Include optional scene trace diagnostics.",
+            "type": "boolean", "value": false, "internal": true
+        },
         "HTML5": {
             "comment": "Running in Web platform",
             "type": "boolean",

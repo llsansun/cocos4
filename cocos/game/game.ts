@@ -23,7 +23,7 @@
  THE SOFTWARE.
 */
 
-import { DEBUG, EDITOR, NATIVE, PREVIEW, TEST, EDITOR_NOT_IN_PREVIEW, WECHAT, USE_XR, NODEJS } from 'internal:constants';
+import { SCENE_TRACE, DEBUG, EDITOR, NATIVE, PREVIEW, TEST, EDITOR_NOT_IN_PREVIEW, WECHAT, USE_XR, NODEJS } from 'internal:constants';
 import { systemInfo } from 'pal/system-info';
 import { findCanvas, loadJsFile } from 'pal/env';
 import { Pacer } from 'pal/pacer';
@@ -43,8 +43,8 @@ import { bindingMappingInfo } from '../rendering/define';
 import { ICustomJointTextureLayout } from '../3d/skeletal-animation/skeletal-animation-utils';
 import { IPhysicsConfig } from '../physics/framework/physics-config';
 import { effectSettings } from '../core/effect-settings';
-import { configureSceneTrace, SceneTraceOptions } from './trace/scene-trace';
-import { resolveSceneTraceOptions } from './trace/trace-auto';
+import type { SceneTraceOptions } from './trace/scene-trace';
+import { traceHooks } from './trace-hooks';
 
 const querySettings = settings.querySettings.bind(settings);
 
@@ -739,8 +739,8 @@ export class Game extends EventTarget {
     public init (config: IGameConfig): Promise<void> {
         this._compatibleWithOldParams(config);
         // DONT change the order unless you know what's you doing
-        return resolveSceneTraceOptions(config.trace, !EDITOR && !TEST && !NATIVE && !NODEJS)
-            .then((traceOptions): void => configureSceneTrace(traceOptions))
+        return (SCENE_TRACE && traceHooks.initialize
+            ? traceHooks.initialize(config.trace, !EDITOR && !TEST && !NATIVE && !NODEJS) : Promise.resolve())
             // #region Base
             .then((): Promise<void[]> => {
                 this.emit(Game.EVENT_PRE_BASE_INIT);

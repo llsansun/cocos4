@@ -1,3 +1,4 @@
+import { traceHooks } from '../trace-hooks';
 /* Copyright (c) 2026 Xiamen Yaji Software Co., Ltd. */
 
 import type { TraceJournal } from './trace-archive';
@@ -451,3 +452,5 @@ export class TracePlayer {
 
 /** Lightweight singleton imported by constructor hooks; no engine dependencies. */
 export const traceRuntime = new TraceRuntime();
+
+traceHooks.runtime = traceRuntime;

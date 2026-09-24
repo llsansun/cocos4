@@ -15,7 +15,7 @@ async function main () {
     const config = cfg.configs[cfg.globalConfigKey];
     const pipeline = settings.rendering.customPipeline ? 'custom-pipeline' : 'legacy-pipeline';
     const features = config.includeModules.filter((feature) => !['custom-pipeline', 'legacy-pipeline'].includes(feature));
-    features.push(pipeline);
+    features.push(pipeline, 'scene-trace');
     fs.cpSync(source, out, { recursive: true });
     await buildEngine({ engine, out: path.join(out, 'cocos-js'), moduleFormat: 'system', mode: 'BUILD', platform: 'HTML5',
         targets: { chrome: '100' }, features, compress: false, mangleProperties: false, sourceMap: true });

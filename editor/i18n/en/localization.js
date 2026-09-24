@@ -1053,6 +1053,10 @@ module.exports = link(mixin({
             label: "Tween",
             description: "Tween system.",
         },
+        scene_trace: {
+            label: 'Scene Trace (Diagnostics)',
+            description: 'Include scene API recording, two-file export and step replay. Disabled by default; use trace.txt in the published directory to start recording.',
+        },
         profiler: {
             label: "Running Stats",
             description: "Include various components and tools used to audit and display rendering stats.",

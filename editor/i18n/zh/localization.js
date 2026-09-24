@@ -1031,6 +1031,10 @@ module.exports = link(mixin({
             label: "缓动系统",
             description: "缓动系统支持。",
         },
+        scene_trace: {
+            label: '场景 Trace（诊断录制）',
+            description: '包含场景 API 录制、两文件导出和步进回放。默认关闭；开启后使用发布目录中的 trace.txt 启动录制。',
+        },
         profiler: {
             label: "运行状态统计",
             description: "包含用于统计、显示渲染数据的组件与工具。",

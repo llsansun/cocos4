@@ -9,7 +9,7 @@ async function main () {
     fs.mkdirSync(out, { recursive: true });
     await buildEngine({ engine, out: path.join(out, 'engine'), moduleFormat: 'esm', mode: 'BUILD', platform: 'HTML5',
         targets: { chrome: '100', safari: '16' },
-        features: ['base', '2d', '3d', 'gfx-webgl', 'gfx-webgl2', 'legacy-pipeline'], compress: false, mangleProperties: false });
+        features: ['scene-trace', 'base', '2d', '3d', 'gfx-webgl', 'gfx-webgl2', 'legacy-pipeline'], compress: false, mangleProperties: false });
     for (const name of ['builtin-effects', 'builtin-glsl4']) {
         const source = fs.readFileSync(path.join(engine, 'tests/fixtures', `${name}.ts`), 'utf8');
         fs.writeFileSync(path.join(out, `${name}.js`), ts.transpileModule(source, {

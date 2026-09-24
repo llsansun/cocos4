@@ -40,3 +40,5 @@ export const VIVO = tryDefineGlobal('CC_VIVO', false);
 export const SUPPORT_JIT = tryDefineGlobal('CC_SUPPORT_JIT', (typeof loadRuntime === 'function'));
 export const SERVER_MODE = false;
 export const NATIVE_CODE_BUNDLE_MODE = NativeCodeBundleMode.WASM;
+
+export const SCENE_TRACE = true;

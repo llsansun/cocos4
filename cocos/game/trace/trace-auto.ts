@@ -1,6 +1,7 @@
+import { traceHooks } from '../trace-hooks';
 /* Copyright (c) 2026 Xiamen Yaji Software Co., Ltd. */
 import { createSceneTracePanel } from './trace-panel';
-import { SceneTraceOptions } from './scene-trace';
+import { configureSceneTrace, SceneTraceOptions } from './scene-trace';
 import { createWebTraceCapture, createWeChatTraceCapture, getWeChatTraceHost, TraceCapture } from './trace-storage';
 
 /** Generated build markers are distinguishable from captured JSONL and SPA fallback pages. */
@@ -61,3 +62,7 @@ export async function resolveSceneTraceOptions (
         return false;
     }
 }
+
+traceHooks.initialize = async (options, automatic): Promise<void> => {
+    configureSceneTrace(await resolveSceneTraceOptions(options, automatic));
+};
