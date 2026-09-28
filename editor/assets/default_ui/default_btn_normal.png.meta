@@ -20,13 +20,14 @@
       "userData": {
         "wrapModeS": "clamp-to-edge",
         "wrapModeT": "clamp-to-edge",
-        "imageUuidOrDatabaseUri": "20835ba4-6145-4fbc-a58a-051ce700aa3e",
-        "isUuid": true,
-        "visible": false,
         "minfilter": "linear",
         "magfilter": "linear",
         "mipfilter": "none",
-        "anisotropy": 0
+        "premultiplyAlpha": false,
+        "anisotropy": 0,
+        "isUuid": true,
+        "imageUuidOrDatabaseUri": "20835ba4-6145-4fbc-a58a-051ce700aa3e",
+        "visible": false
       },
       "displayName": "default_btn_normal",
       "id": "6c48a",
@@ -42,6 +43,14 @@
       ],
       "subMetas": {},
       "userData": {
+        "wrapModeS": "clamp-to-edge",
+        "wrapModeT": "clamp-to-edge",
+        "minfilter": "linear",
+        "magfilter": "linear",
+        "premultiplyAlpha": false,
+        "generateMipmap": false,
+        "anisotropy": 1,
+        "trimType": "auto",
         "trimThreshold": 1,
         "rotated": false,
         "offsetX": 0,
@@ -52,15 +61,15 @@
         "height": 40,
         "rawWidth": 40,
         "rawHeight": 40,
-        "borderTop": 0,
-        "borderBottom": 0,
-        "borderLeft": 0,
-        "borderRight": 0,
+        "borderTop": 12,
+        "borderBottom": 12,
+        "borderLeft": 12,
+        "borderRight": 12,
+        "isUuid": true,
+        "imageUuidOrDatabaseUri": "20835ba4-6145-4fbc-a58a-051ce700aa3e@6c48a",
+        "atlasUuid": "",
+        "mipfilter": "none",
         "packable": true,
-        "pixelsToUnit": 100,
-        "pivotX": 0.5,
-        "pivotY": 0.5,
-        "meshType": 0,
         "vertices": {
           "rawPosition": [
             -20,
@@ -115,10 +124,10 @@
             0
           ]
         },
-        "isUuid": true,
-        "imageUuidOrDatabaseUri": "20835ba4-6145-4fbc-a58a-051ce700aa3e@6c48a",
-        "atlasUuid": "",
-        "trimType": "auto"
+        "pixelsToUnit": 100,
+        "pivotX": 0.5,
+        "pivotY": 0.5,
+        "meshType": 0
       },
       "displayName": "default_btn_normal",
       "id": "f9941",

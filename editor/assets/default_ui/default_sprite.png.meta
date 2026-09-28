@@ -20,13 +20,14 @@
       "userData": {
         "wrapModeS": "clamp-to-edge",
         "wrapModeT": "clamp-to-edge",
-        "imageUuidOrDatabaseUri": "57520716-48c8-4a19-8acf-41c9f8777fb0",
-        "isUuid": true,
-        "visible": false,
         "minfilter": "linear",
         "magfilter": "linear",
         "mipfilter": "none",
-        "anisotropy": 0
+        "premultiplyAlpha": false,
+        "anisotropy": 0,
+        "isUuid": true,
+        "imageUuidOrDatabaseUri": "57520716-48c8-4a19-8acf-41c9f8777fb0",
+        "visible": false
       },
       "displayName": "default_sprite",
       "id": "6c48a",
@@ -42,6 +43,14 @@
       ],
       "subMetas": {},
       "userData": {
+        "wrapModeS": "clamp-to-edge",
+        "wrapModeT": "clamp-to-edge",
+        "minfilter": "linear",
+        "magfilter": "linear",
+        "premultiplyAlpha": false,
+        "generateMipmap": false,
+        "anisotropy": 1,
+        "trimType": "auto",
         "trimThreshold": 1,
         "rotated": false,
         "offsetX": 0,
@@ -56,11 +65,11 @@
         "borderBottom": 0,
         "borderLeft": 0,
         "borderRight": 0,
+        "isUuid": true,
+        "imageUuidOrDatabaseUri": "57520716-48c8-4a19-8acf-41c9f8777fb0@6c48a",
+        "atlasUuid": "",
+        "mipfilter": "none",
         "packable": true,
-        "pixelsToUnit": 100,
-        "pivotX": 0.5,
-        "pivotY": 0.5,
-        "meshType": 0,
         "vertices": {
           "rawPosition": [
             -20,
@@ -115,10 +124,10 @@
             0
           ]
         },
-        "isUuid": true,
-        "imageUuidOrDatabaseUri": "57520716-48c8-4a19-8acf-41c9f8777fb0@6c48a",
-        "atlasUuid": "",
-        "trimType": "auto"
+        "pixelsToUnit": 100,
+        "pivotX": 0.5,
+        "pivotY": 0.5,
+        "meshType": 0
       },
       "displayName": "default_sprite",
       "id": "f9941",

@@ -23,6 +23,7 @@
         "minfilter": "linear",
         "magfilter": "linear",
         "mipfilter": "none",
+        "premultiplyAlpha": false,
         "anisotropy": 0,
         "isUuid": true,
         "imageUuidOrDatabaseUri": "61ac0181-00bd-4c17-97f0-5fc7f4bafb3d",
